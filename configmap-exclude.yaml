@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cert-monitor-exclude
+  namespace: cert-monitor
+data:
+  namespaces: |
+    - openshift.*
+    - kube.*
+    - default
+    - projeto_legado

@@ -1,0 +1,26 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: alert-certificados-expirando
+  namespace: cert-monitor
+spec:
+  groups:
+  - name: cert-expiration-alerts
+    rules:
+    - alert: ExpiredCertificateWarning
+      expr: cert_expiry_days_remaining <= 60 and cert_expiry_days_remaining > 30
+      for: 1m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Certificado expira em menos de 60 dias"
+        description: "O certificado {{ $labels.name }} (chave {{ $labels.key }}) no namespace {{ $labels.exported_namespace }} irá expirar em {{ $value }} dias. Data Limite: {{ $labels.not_after }}."
+    
+    - alert: ExpiredCertificateCritical
+      expr: cert_expiry_days_remaining <= 30
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Certificado expira em menos de 30 dias"
+        description: "CRÍTICO: O certificado {{ $labels.name }} (chave {{ $labels.key }}) no namespace {{ $labels.exported_namespace }} expira em apenas {{ $value }} dias. Substitua imediatamente!"

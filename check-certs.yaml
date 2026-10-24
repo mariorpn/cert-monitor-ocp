@@ -1,0 +1,86 @@
+---
+- name: Verificar certificados do OpenShift e Exportar Métricas
+  hosts: localhost
+  gather_facts: true
+  collections:
+    - kubernetes.core
+    - community.crypto
+  
+  tasks:
+    - name: Buscar ConfigMap de exclusão de namespaces
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: ConfigMap
+        name: cert-monitor-exclude
+        namespace: cert-monitor
+      register: exclude_cm
+
+    - name: Construir regex de namespaces ignorados
+      ansible.builtin.set_fact:
+        regex_ignorados: >-
+          {%- if exclude_cm.resources | length > 0 and exclude_cm.resources[0].data is defined and 'namespaces' in exclude_cm.resources[0].data -%}
+            ^(?:{{ (exclude_cm.resources[0].data.namespaces | from_yaml) | join('|') }})$
+          {%- else -%}
+            ^$
+          {%- endif -%}
+
+    - name: Buscar todos os Secrets no cluster
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+      register: secrets_brutos
+
+    - name: Buscar todos os ConfigMaps no cluster
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: ConfigMap
+      register: configmaps_brutos
+
+    - name: Extrair e organizar certificados
+      ansible.builtin.set_fact:
+        lista_certificados: >-
+          {%- set result = [] -%}
+          {%- for sec in secrets_brutos.resources if 'data' in sec and sec['data'] and not (sec['metadata']['namespace'] | regex_search(regex_ignorados)) -%}
+            {%- for k, v in sec['data'].items() if k.endswith('.crt') or k.endswith('.pem') or k == 'tls.crt' -%}
+              {%- set decoded = v | b64decode -%}
+              {%- if 'BEGIN CERTIFICATE' in decoded -%}
+                {%- set _ = result.append({'ns': sec['metadata']['namespace'], 'name': sec['metadata']['name'], 'key': k, 'tipo': 'SECRET', 'conteudo': decoded}) -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {%- for cm in configmaps_brutos.resources if 'data' in cm and cm['data'] and not (cm['metadata']['namespace'] | regex_search(regex_ignorados)) -%}
+            {%- for k, v in cm['data'].items() if k.endswith('.crt') or k.endswith('.pem') or k == 'ca-bundle.crt' -%}
+              {%- if 'BEGIN CERTIFICATE' in v -%}
+                {%- set _ = result.append({'ns': cm['metadata']['namespace'], 'name': cm['metadata']['name'], 'key': k, 'tipo': 'CONFIGMAP', 'conteudo': v}) -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ result }}
+
+    - name: Analisar a validade de cada certificado
+      community.crypto.x509_certificate_info:
+        content: "{{ item.conteudo }}"
+      loop: "{{ lista_certificados }}"
+      register: cert_info_results
+      failed_when: false
+      no_log: false
+
+    - name: Gerar payload de métricas do Prometheus
+      ansible.builtin.set_fact:
+        prometheus_payload: |
+          # HELP cert_expiry_days_remaining Dias restantes para o certificado expirar
+          # TYPE cert_expiry_days_remaining gauge
+          {% set agora = ansible_date_time.epoch | float %}
+          {% for res in cert_info_results.results if res.not_after is defined and res.not_before is defined %}
+            {% set cert = res.item %}
+            {% set expiracao = (res.not_after | to_datetime('%Y%m%d%H%M%SZ')).timestamp() | float %}
+            {% set dias = ((expiracao - agora) / 86400) | int %}
+            cert_expiry_days_remaining{namespace="{{ cert.ns }}", tipo="{{ cert.tipo }}", name="{{ cert.name }}", key="{{ cert.key }}", not_before="{{ res.not_before }}", not_after="{{ res.not_after }}"} {{ dias }}
+          {% endfor %}
+
+    - name: Enviar métricas para o Pushgateway
+      ansible.builtin.uri:
+        url: "{{ lookup('env', 'PUSHGATEWAY_URL') | default('http://pushgateway.cert-monitor.svc.cluster.local:9091', true) }}/metrics/job/cert_monitor"
+        method: POST
+        body: "{{ prometheus_payload }}"
+        status_code: [200, 202]

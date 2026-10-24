@@ -1,0 +1,60 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-monitor
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cert-monitor-sa
+  namespace: cert-monitor
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cert-monitor-cr
+rules:
+- apiGroups: [""]
+  resources: ["secrets", "configmaps"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cert-monitor-crb
+subjects:
+- kind: ServiceAccount
+  name: cert-monitor-sa
+  namespace: cert-monitor
+roleRef:
+  kind: ClusterRole
+  name: cert-monitor-cr
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cert-monitor-cron
+  namespace: cert-monitor
+spec:
+  schedule: "0 */12 * * *"
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: cert-monitor-sa
+          restartPolicy: OnFailure
+          containers:
+          - name: ansible-cert-monitor
+            image: image-registry.openshift-image-registry.svc:5000/cert-monitor/ansible-cert-monitor:latest
+            imagePullPolicy: Always
+            env:
+            - name: PUSHGATEWAY_URL
+              value: "http://pushgateway.cert-monitor.svc.cluster.local:9091"
+
+containers:
+          - name: ansible-cert-monitor
+            image: image-registry.openshift-image-registry.svc:5000/cert-monitor/ansible-cert-monitor:latest
