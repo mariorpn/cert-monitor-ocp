@@ -18,10 +18,23 @@ spec:
     spec:
       containers:
       - name: pushgateway
-        image: docker.io/prom/pushgateway:latest
+        image: quay.io/prometheus/pushgateway:v1.11.5
+        args:
+        # Mantém as métricas se o container reiniciar. Para sobreviver também à recriação do pod,
+        # troque o emptyDir abaixo por um PersistentVolumeClaim.
+        - --persistence.file=/data/metrics
+        - --persistence.interval=1m
         ports:
         - containerPort: 9091
           name: metrics
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: metrics
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: metrics
         resources:
           limits:
             memory: "128Mi"
@@ -32,6 +45,12 @@ spec:
         securityContext:
           runAsNonRoot: true
           allowPrivilegeEscalation: false
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -62,3 +81,30 @@ spec:
     path: /metrics
     interval: 30s
     honorLabels: true
+---
+# Só o CronJob pode enviar métricas e só o Prometheus da plataforma/user workload pode coletá-las
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pushgateway-ingress
+  namespace: cert-monitor
+spec:
+  podSelector:
+    matchLabels:
+      app: pushgateway
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: cert-monitor
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-monitoring
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-user-workload-monitoring
+    ports:
+    - port: 9091
+      protocol: TCP

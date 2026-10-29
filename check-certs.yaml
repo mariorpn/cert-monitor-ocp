@@ -1,13 +1,21 @@
 ---
 - name: Verificar certificados do OpenShift e Exportar Métricas
   hosts: localhost
-  gather_facts: true
-  collections:
-    - kubernetes.core
-    - community.crypto
-  
+  gather_facts: false
+
+  vars:
+    pushgateway_url: "{{ lookup('env', 'PUSHGATEWAY_URL') | default('http://pushgateway.cert-monitor.svc.cluster.local:9091', true) }}"
+    # Tipos de Secret que nunca carregam certificados de interesse (ou são grandes demais para trazer à toa)
+    secret_types_ignorados:
+      - kubernetes.io/service-account-token
+      - kubernetes.io/dockercfg
+      - kubernetes.io/dockerconfigjson
+      - helm.sh/release.v1
+    epoch_zero: '1970-01-01 00:00:00'
+    pem_regex: '-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----'
+
   tasks:
-    - name: Buscar ConfigMap de exclusão de namespaces
+    - name: Buscar ConfigMap de exclusão
       kubernetes.core.k8s_info:
         api_version: v1
         kind: ConfigMap
@@ -15,20 +23,30 @@
         namespace: cert-monitor
       register: exclude_cm
 
-    - name: Construir regex de namespaces ignorados
+    - name: Construir regex de namespaces e recursos ignorados
       ansible.builtin.set_fact:
         regex_ignorados: >-
-          {%- if exclude_cm.resources | length > 0 and exclude_cm.resources[0].data is defined and 'namespaces' in exclude_cm.resources[0].data -%}
-            ^(?:{{ (exclude_cm.resources[0].data.namespaces | from_yaml) | join('|') }})$
+          {%- set data = exclude_cm.resources[0].data | default({}) if exclude_cm.resources | length > 0 else {} -%}
+          {%- if data.namespaces is defined -%}
+            ^(?:{{ (data.namespaces | from_yaml) | join('|') }})$
+          {%- else -%}
+            ^$
+          {%- endif -%}
+        regex_nomes_ignorados: >-
+          {%- set data = exclude_cm.resources[0].data | default({}) if exclude_cm.resources | length > 0 else {} -%}
+          {%- if data.nomes is defined -%}
+            ^(?:{{ (data.nomes | from_yaml) | join('|') }})$
           {%- else -%}
             ^$
           {%- endif -%}
 
-    - name: Buscar todos os Secrets no cluster
+    - name: Buscar os Secrets do cluster
       kubernetes.core.k8s_info:
         api_version: v1
         kind: Secret
+        field_selectors: "{{ secret_types_ignorados | map('regex_replace', '^', 'type!=') | list }}"
       register: secrets_brutos
+      no_log: true
 
     - name: Buscar todos os ConfigMaps no cluster
       kubernetes.core.k8s_info:
@@ -36,51 +54,85 @@
         kind: ConfigMap
       register: configmaps_brutos
 
+    # Cada certificado de um bundle/cadeia vira uma entrada própria (campo indice).
+    # Só os blocos BEGIN/END CERTIFICATE são guardados, nunca chaves privadas.
     - name: Extrair e organizar certificados
       ansible.builtin.set_fact:
         lista_certificados: >-
           {%- set result = [] -%}
-          {%- for sec in secrets_brutos.resources if 'data' in sec and sec['data'] and not (sec['metadata']['namespace'] | regex_search(regex_ignorados)) -%}
-            {%- for k, v in sec['data'].items() if k.endswith('.crt') or k.endswith('.pem') or k == 'tls.crt' -%}
-              {%- set decoded = v | b64decode -%}
-              {%- if 'BEGIN CERTIFICATE' in decoded -%}
-                {%- set _ = result.append({'ns': sec['metadata']['namespace'], 'name': sec['metadata']['name'], 'key': k, 'tipo': 'SECRET', 'conteudo': decoded}) -%}
-              {%- endif -%}
-            {%- endfor -%}
+          {%- set fontes = [] -%}
+          {%- for sec in secrets_brutos.resources if sec.data | default({}) -%}
+            {%- set _ = fontes.append({'obj': sec, 'tipo': 'SECRET', 'data': sec.data, 'b64': true}) -%}
           {%- endfor -%}
-          {%- for cm in configmaps_brutos.resources if 'data' in cm and cm['data'] and not (cm['metadata']['namespace'] | regex_search(regex_ignorados)) -%}
-            {%- for k, v in cm['data'].items() if k.endswith('.crt') or k.endswith('.pem') or k == 'ca-bundle.crt' -%}
-              {%- if 'BEGIN CERTIFICATE' in v -%}
-                {%- set _ = result.append({'ns': cm['metadata']['namespace'], 'name': cm['metadata']['name'], 'key': k, 'tipo': 'CONFIGMAP', 'conteudo': v}) -%}
-              {%- endif -%}
+          {%- for cm in configmaps_brutos.resources -%}
+            {%- if cm.data | default({}) -%}
+              {%- set _ = fontes.append({'obj': cm, 'tipo': 'CONFIGMAP', 'data': cm.data, 'b64': false}) -%}
+            {%- endif -%}
+            {%- if cm.binaryData | default({}) -%}
+              {%- set _ = fontes.append({'obj': cm, 'tipo': 'CONFIGMAP', 'data': cm.binaryData, 'b64': true}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- for f in fontes if not (f.obj.metadata.namespace | regex_search(regex_ignorados))
+                                and not (f.obj.metadata.name | regex_search(regex_nomes_ignorados)) -%}
+            {%- for k, v in f.data.items() if k.endswith('.crt') or k.endswith('.pem') -%}
+              {%- set texto = v | b64decode if f.b64 else v -%}
+              {%- for pem in texto | regex_findall(pem_regex) -%}
+                {%- set _ = result.append({'ns': f.obj.metadata.namespace, 'name': f.obj.metadata.name, 'key': k,
+                                           'tipo': f.tipo, 'indice': loop.index0, 'pem': pem}) -%}
+              {%- endfor -%}
             {%- endfor -%}
           {%- endfor -%}
           {{ result }}
+      no_log: true
+
+    # O mesmo certificado costuma aparecer em vários recursos; cada PEM é analisado uma única vez.
+    - name: Listar certificados únicos
+      ansible.builtin.set_fact:
+        pems_unicos: "{{ lista_certificados | map(attribute='pem') | unique | list }}"
+      no_log: true
 
     - name: Analisar a validade de cada certificado
       community.crypto.x509_certificate_info:
-        content: "{{ item.conteudo }}"
-      loop: "{{ lista_certificados }}"
+        content: "{{ item }}"
+      loop: "{{ pems_unicos }}"
       register: cert_info_results
       failed_when: false
-      no_log: false
+      no_log: true
 
+    - name: Indexar informações por certificado
+      ansible.builtin.set_fact:
+        info_por_pem: "{{ dict(pems_unicos | zip(cert_info_results.results)) }}"
+      no_log: true
+
+    # Datas ASN.1 são UTC; subtrair o epoch como datetime ingênuo evita depender do TZ do container.
     - name: Gerar payload de métricas do Prometheus
       ansible.builtin.set_fact:
         prometheus_payload: |
-          # HELP cert_expiry_days_remaining Dias restantes para o certificado expirar
-          # TYPE cert_expiry_days_remaining gauge
-          {% set agora = ansible_date_time.epoch | float %}
-          {% for res in cert_info_results.results if res.not_after is defined and res.not_before is defined %}
-            {% set cert = res.item %}
-            {% set expiracao = (res.not_after | to_datetime('%Y%m%d%H%M%SZ')).timestamp() | float %}
-            {% set dias = ((expiracao - agora) / 86400) | int %}
-            cert_expiry_days_remaining{namespace="{{ cert.ns }}", tipo="{{ cert.tipo }}", name="{{ cert.name }}", key="{{ cert.key }}", not_before="{{ res.not_before }}", not_after="{{ res.not_after }}"} {{ dias }}
+          # HELP cert_not_after_timestamp_seconds Data de expiração do certificado (epoch UTC)
+          # TYPE cert_not_after_timestamp_seconds gauge
+          {% for cert in lista_certificados %}
+          {% set res = info_por_pem[cert.pem] %}
+          {% if res.not_after is defined %}
+          {% set expiracao = ((res.not_after | to_datetime('%Y%m%d%H%M%SZ')) - (epoch_zero | to_datetime)).total_seconds() | int %}
+          {% set cn = (res.subject.commonName | default('')) | replace('\\', '\\\\') | replace('"', '\\"') | replace('\n', ' ') %}
+          cert_not_after_timestamp_seconds{cert_namespace="{{ cert.ns }}",tipo="{{ cert.tipo }}",name="{{ cert.name }}",key="{{ cert.key }}",indice="{{ cert.indice }}",subject_cn="{{ cn }}",not_after="{{ res.not_after }}"} {{ expiracao }}
+          {% endif %}
           {% endfor %}
+          # HELP cert_monitor_certificates Certificados encontrados na última varredura
+          # TYPE cert_monitor_certificates gauge
+          cert_monitor_certificates {{ lista_certificados | length }}
+          # HELP cert_monitor_parse_errors Certificados únicos que não puderam ser analisados
+          # TYPE cert_monitor_parse_errors gauge
+          cert_monitor_parse_errors {{ cert_info_results.results | selectattr('not_after', 'undefined') | list | length }}
+          # HELP cert_monitor_last_run_timestamp_seconds Momento da última varredura concluída (epoch UTC)
+          # TYPE cert_monitor_last_run_timestamp_seconds gauge
+          cert_monitor_last_run_timestamp_seconds {{ (now(utc=true) - (epoch_zero | to_datetime)).total_seconds() | int }}
+      no_log: true
 
+    # PUT substitui o grupo inteiro: certificados removidos do cluster somem do Pushgateway.
     - name: Enviar métricas para o Pushgateway
       ansible.builtin.uri:
-        url: "{{ lookup('env', 'PUSHGATEWAY_URL') | default('http://pushgateway.cert-monitor.svc.cluster.local:9091', true) }}/metrics/job/cert_monitor"
-        method: POST
+        url: "{{ pushgateway_url }}/metrics/job/cert_monitor"
+        method: PUT
         body: "{{ prometheus_payload }}"
         status_code: [200, 202]

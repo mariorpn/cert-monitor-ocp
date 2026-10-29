@@ -1,15 +1,17 @@
-# Usa a imagem oficial Red Hat UBI 9 com Python 3.11
-FROM registry.access.redhat.com/ubi9/python-311:latest
+# Usa a imagem oficial Red Hat UBI 9 com Python 3.12 (tag fixa para builds reproduzíveis)
+FROM registry.access.redhat.com/ubi9/python-312:9.8-1790171739
 
 # Muda temporariamente para root para instalar pacotes e ajustar permissões
 USER root
 
-# Atualiza o pip e instala as dependências
+# Instala as dependências Python com versões fixas
+COPY requirements.txt requirements.yml /tmp/deps/
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir ansible kubernetes cryptography
+    pip install --no-cache-dir -r /tmp/deps/requirements.txt
 
-# Instala as collections necessárias
-RUN ansible-galaxy collection install kubernetes.core community.crypto
+# Instala as collections num caminho padrão do Ansible, independente do HOME em tempo de execução
+RUN ansible-galaxy collection install -r /tmp/deps/requirements.yml -p /usr/share/ansible/collections && \
+    rm -rf /tmp/deps
 
 # Prepara o diretório de trabalho
 WORKDIR /opt/app-root/src

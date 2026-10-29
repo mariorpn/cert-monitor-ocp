@@ -4,8 +4,14 @@ metadata:
   name: cert-monitor-exclude
   namespace: cert-monitor
 data:
+  # Regex (casamento exato) dos namespaces ignorados na varredura
   namespaces: |
     - openshift.*
     - kube.*
     - default
-    - projeto_legado
+    - projeto-legado
+  # Regex (casamento exato) dos nomes de Secret/ConfigMap ignorados em qualquer namespace.
+  # Os CAs abaixo são replicados em todos os namespaces e rotacionados pela própria plataforma.
+  nomes: |
+    - kube-root-ca\.crt
+    - openshift-service-ca\.crt
