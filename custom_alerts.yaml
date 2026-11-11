@@ -7,20 +7,49 @@ spec:
   groups:
   - name: cert-expiration-alerts
     rules:
-    - alert: ExpiredCertificateWarning
-      expr: cert_expiry_days_remaining <= 60 and cert_expiry_days_remaining > 30
+    - alert: CertificateExpiringSoon
+      expr: (cert_not_after_timestamp_seconds - time()) / 86400 <= 60 and (cert_not_after_timestamp_seconds - time()) / 86400 > 30
       for: 1m
       labels:
         severity: warning
       annotations:
         summary: "Certificado expira em menos de 60 dias"
-        description: "O certificado {{ $labels.name }} (chave {{ $labels.key }}) no namespace {{ $labels.exported_namespace }} irá expirar em {{ $value }} dias. Data Limite: {{ $labels.not_after }}."
-    
-    - alert: ExpiredCertificateCritical
-      expr: cert_expiry_days_remaining <= 30
+        description: "O certificado {{ $labels.name }} (chave {{ $labels.key }}, posição {{ $labels.indice }}, CN {{ $labels.subject_cn }}) no namespace {{ $labels.cert_namespace }} irá expirar em {{ $value | printf \"%.0f\" }} dias. Data Limite: {{ $labels.not_after }}."
+
+    - alert: CertificateExpiringCritical
+      expr: (cert_not_after_timestamp_seconds - time()) / 86400 <= 30
       for: 1m
       labels:
         severity: critical
       annotations:
-        summary: "Certificado expira em menos de 30 dias"
-        description: "CRÍTICO: O certificado {{ $labels.name }} (chave {{ $labels.key }}) no namespace {{ $labels.exported_namespace }} expira em apenas {{ $value }} dias. Substitua imediatamente!"
+        summary: "Certificado expira em menos de 30 dias (ou já expirou)"
+        description: "CRÍTICO: O certificado {{ $labels.name }} (chave {{ $labels.key }}, posição {{ $labels.indice }}, CN {{ $labels.subject_cn }}) no namespace {{ $labels.cert_namespace }} expira em {{ $value | printf \"%.0f\" }} dias. Substitua imediatamente!"
+
+  - name: cert-monitor-health
+    rules:
+    - alert: CertMonitorStale
+      expr: time() - max(cert_monitor_last_run_timestamp_seconds) > 26 * 3600
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Varredura de certificados atrasada"
+        description: "A última varredura concluída do cert-monitor foi há {{ $value | humanizeDuration }}. Verifique o CronJob cert-monitor-cron."
+
+    - alert: CertMonitorAbsent
+      expr: absent(cert_monitor_last_run_timestamp_seconds)
+      for: 1h
+      labels:
+        severity: warning
+      annotations:
+        summary: "Métricas do cert-monitor ausentes"
+        description: "Nenhuma métrica do cert-monitor está sendo coletada. Verifique o Pushgateway, o ServiceMonitor e o CronJob."
+
+    - alert: CertMonitorParseErrors
+      expr: cert_monitor_parse_errors > 0
+      for: 1m
+      labels:
+        severity: info
+      annotations:
+        summary: "Certificados que não puderam ser analisados"
+        description: "{{ $value }} certificado(s) encontrados no cluster não puderam ser analisados na última varredura."

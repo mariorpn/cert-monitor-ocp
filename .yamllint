@@ -1,0 +1,17 @@
+---
+extends: default
+
+rules:
+  line-length: disable
+  document-start: disable
+  truthy:
+    allowed-values: ["true", "false"]
+    check-keys: false
+  indentation:
+    indent-sequences: whatever
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: disable
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true
