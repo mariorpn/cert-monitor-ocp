@@ -7,31 +7,41 @@ A solução integra-se à stack de monitoramento do OpenShift, gerando alertas n
 
 ## Estrutura de Arquivos
 * `check-certs.yaml`: Playbook Ansible que realiza a varredura e envia as métricas ao Pushgateway.
-* `Containerfile`: Instruções de build da imagem (Red Hat UBI 9) com permissões ajustadas para OpenShift.
+* `Containerfile`: Instruções de build da imagem (Red Hat UBI 9 com Python 3.12) com permissões ajustadas para OpenShift.
 * `requirements.txt` / `requirements.yml`: Versões fixas dos pacotes Python e das collections Ansible usadas na imagem.
 * `kustomization.yaml`: Ponto de entrada para implantação via Kustomize.
-* `manifestos-rbac-cronjob.yaml`: Namespace `cert-monitor`, ServiceAccount, ClusterRole (apenas get/list em secrets/configmaps), ClusterRoleBinding e o CronJob (a cada 12 horas).
+* `manifestos-rbac-cronjob.yaml`: Namespace `cert-monitor`, ServiceAccount, ClusterRole (apenas get/list em secrets/configmaps), ClusterRoleBinding e o CronJob (às 00:00 e às 12:00, `0 */12 * * *`, no fuso do kube-controller-manager, normalmente UTC).
 * `configmap-exclude.yaml`: Regex dos namespaces e dos nomes de recursos ignorados na varredura.
 * `pushgateway.yaml`: Deployment, Service, ServiceMonitor e NetworkPolicy do Pushgateway.
 * `custom_alerts.yaml`: PrometheusRule com os alertas de expiração e de saúde do monitor.
 * `build-config.yaml`: ImageStream e BuildConfig para compilação nativa no cluster.
+* `.github/workflows/lint.yml` / `.yamllint`: CI de validação (yamllint, ansible-lint e kubeconform) e sua configuração.
 
 ## Métricas Exportadas
 | Métrica | Descrição |
 |---|---|
-| `cert_not_after_timestamp_seconds` | Data de expiração (epoch UTC). Labels: `cert_namespace`, `tipo`, `name`, `key`, `indice` (posição no bundle), `subject_cn`, `not_after`. |
-| `cert_monitor_certificates` | Quantidade de certificados encontrados na última varredura. |
-| `cert_monitor_parse_errors` | Certificados que não puderam ser analisados. |
-| `cert_monitor_last_run_timestamp_seconds` | Momento da última varredura concluída. |
+| `cert_not_after_timestamp_seconds` | Data de expiração (epoch UTC). Labels: `cert_namespace`, `tipo` (`SECRET`/`CONFIGMAP`), `name`, `key`, `indice` (posição no bundle), `subject_cn`, `not_after` (formato `AAAAMMDDhhmmssZ`, UTC). |
+| `cert_monitor_certificates` | Quantidade de entradas encontradas na última varredura. O mesmo certificado presente em vários recursos ou posições conta várias vezes. |
+| `cert_monitor_parse_errors` | Certificados únicos (PEM) que não puderam ser analisados. |
+| `cert_monitor_last_run_timestamp_seconds` | Momento da última varredura concluída (epoch UTC). |
+
+O Pushgateway acrescenta o label `job="cert_monitor"`, e o User Workload Monitoring acrescenta `namespace="cert-monitor"` (por isso o namespace do certificado fica em `cert_namespace`).
 
 Os dias restantes são calculados no próprio Prometheus (`(cert_not_after_timestamp_seconds - time()) / 86400`), portanto continuam diminuindo mesmo que o CronJob pare de rodar.
 
+As métricas são enviadas com `PUT`, que substitui o grupo inteiro: certificados removidos do cluster (ou excluídos via ConfigMap) somem das métricas na execução seguinte.
+
 ## Alertas
-* `CertificateExpiringSoon` (warning): expira entre 30 e 60 dias.
-* `CertificateExpiringCritical` (critical): expira em 30 dias ou menos (inclui já expirados).
-* `CertMonitorStale` (warning): nenhuma varredura concluída nas últimas 26 horas.
-* `CertMonitorAbsent` (warning): métricas do monitor ausentes.
-* `CertMonitorParseErrors` (info): certificados que não puderam ser analisados.
+* `CertificateExpiringSoon` (warning): expira entre 30 e 60 dias (`for: 1m`).
+* `CertificateExpiringCritical` (critical): expira em 30 dias ou menos, inclusive já expirados (`for: 1m`).
+* `CertMonitorStale` (warning): nenhuma varredura concluída nas últimas 26 horas (`for: 10m`). Com o agendamento de 12 em 12 horas, tolera uma execução perdida.
+* `CertMonitorAbsent` (warning): métricas do monitor ausentes (`for: 1h`).
+* `CertMonitorParseErrors` (info): certificados que não puderam ser analisados (`for: 1m`).
+
+## Pré-requisitos
+* OpenShift 4.x com o User Workload Monitoring habilitado (ver passo 1 abaixo).
+* Registry interno de imagens habilitado: o CronJob usa a imagem `image-registry.openshift-image-registry.svc:5000/cert-monitor/ansible-cert-monitor:latest`.
+* Permissão de cluster-admin para criar o Namespace, a ClusterRole e a ClusterRoleBinding.
 
 ## Como Configurar e Instalar no Cluster
 
@@ -59,30 +69,59 @@ Faça o build nativo da imagem enviando os arquivos locais para o OpenShift:
 oc start-build ansible-cert-monitor-build --from-dir=. --follow -n cert-monitor
 ```
 
-Até o primeiro build terminar, execuções do CronJob falharão por falta da imagem.
+Até o primeiro build terminar, execuções do CronJob falharão por falta da imagem. Alterações no playbook (`check-certs.yaml`) ou nas dependências exigem um novo build; alterações nos manifestos e no ConfigMap de exclusão exigem apenas `oc apply -k .`.
 
 ## Como Usar
 O sistema opera de forma autônoma a cada 12 horas.
 
-Para testar manualmente, crie um Job a partir do CronJob:
+Para testar manualmente, crie um Job a partir do CronJob e acompanhe o log:
 
 ```bash
-oc create job --from=cronjob/cert-monitor-cron cert-monitor-manual-run -n cert-monitor
+JOB=cert-monitor-manual-run-$(date +%s)
+oc create job --from=cronjob/cert-monitor-cron "$JOB" -n cert-monitor
+oc logs -f "job/$JOB" -n cert-monitor
 ```
 
-Para ignorar namespaces ou recursos: edite o ConfigMap `cert-monitor-exclude`, chaves `namespaces` e `nomes`, adicionando nomes exatos ou regex (ex: `kube.*`). Por padrão, os namespaces `openshift-*` são ignorados, **exceto** `openshift-config` (certificado custom da API) e `openshift-ingress` (certificado do router), que são renovados manualmente. Também são ignorados `kube-root-ca.crt` e `openshift-service-ca.crt`, pois existem em todos os namespaces e são rotacionados pela plataforma, e os bundles `config-trusted-cabundle` / `trusted-ca-bundle`, injetados pelo OpenShift com todas as CAs públicas do sistema (CAs customizadas do cluster continuam monitoradas em `openshift-config/user-ca-bundle`).
+### Exclusões
+Para ignorar namespaces ou recursos, edite o ConfigMap `cert-monitor-exclude`, chaves `namespaces` e `nomes`. Cada item é uma regex Python com casamento exato (`^(?:item1|item2)$`), então nomes exatos também funcionam e lookahead é suportado. O ConfigMap é lido a cada execução, sem necessidade de rebuild. A exclusão é aplicada no playbook: os recursos continuam sendo lidos da API.
 
-Certificados fora da RFC 5280 (`commonName` com mais de 64 bytes, número de série negativo ou zero) continuam sendo monitorados, e são listados no log do Job pela task "Listar certificados fora dos limites da RFC 5280". No Prometheus, a busca equivalente para CN longo é `cert_not_after_timestamp_seconds{subject_cn=~".{65,}"}`.
+Por padrão:
+* Namespaces: os `openshift-*` são ignorados (`openshift-(?!config$|ingress$).*`), **exceto** `openshift-config` (certificado custom da API) e `openshift-ingress` (certificado do router), que são renovados manualmente. Também são ignorados `openshift`, `kube.*`, `default` e `projeto-legado`; este último é apenas um exemplo, ajuste ao seu ambiente.
+* Nomes: `kube-root-ca.crt` e `openshift-service-ca.crt`, que existem em todos os namespaces e são rotacionados pela plataforma, e os bundles `config-trusted-cabundle` / `trusted-ca-bundle`, injetados pelo OpenShift com todas as CAs públicas do sistema. CAs customizadas do cluster continuam monitoradas em `openshift-config/user-ca-bundle`.
 
 Somente as chaves terminadas em `.crt`, `.pem`, `.cer` ou `.cert` são lidas (lista em `extensoes_certificado` no playbook).
 
 Secrets dos tipos `service-account-token`, `dockercfg`, `dockerconfigjson` e `helm.sh/release.v1` não são lidos (lista em `secret_types_ignorados` no playbook).
 
+### Certificados fora da RFC 5280
+Alguns certificados violam limites da RFC 5280 e continuam sendo monitorados normalmente. Os casos verificados (no subject e no issuer) são:
+* `commonName` fora de 1 a 64 bytes (UTF-8);
+* `countryName` / `jurisdictionCountryName` com tamanho diferente de 2;
+* número de série negativo ou zero. Algumas CAs raiz públicas foram emitidas com série 0 (ex.: Go Daddy e Starfield G2).
+
+Esses certificados são listados no log do Job pela task "Listar certificados fora dos limites da RFC 5280", com namespace, nome, chave e posição. Os avisos crus que a biblioteca `cryptography` emitiria no stderr são silenciados pela variável `PYTHONWARNINGS` do CronJob. No Prometheus, a busca equivalente para CN longo é `cert_not_after_timestamp_seconds{subject_cn=~".{65,}"}`.
+
 ## Considerações de Segurança
 * A ClusterRole concede `get/list` em **todos os Secrets do cluster**. Qualquer um com acesso ao token da ServiceAccount `cert-monitor-sa` consegue ler essas credenciais. Restrinja o acesso ao namespace `cert-monitor`.
-* O playbook guarda apenas os blocos `BEGIN/END CERTIFICATE`; chaves privadas nunca são extraídas, e as tasks que manipulam conteúdo de Secrets usam `no_log: true`.
+* O playbook guarda apenas os blocos `BEGIN/END CERTIFICATE`; chaves privadas nunca são extraídas, e as tasks que manipulam conteúdo de Secrets usam `no_log: true`. A task de RFC 5280 não usa `no_log`, mas exibe apenas metadados e atributos que já constam nas métricas.
+* Os containers rodam sem privilégios: `runAsNonRoot`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` e `seccompProfile: RuntimeDefault`.
 * O Pushgateway não tem autenticação; a NetworkPolicy limita o acesso ao pod do CronJob e aos namespaces de monitoramento.
-* O Pushgateway persiste as métricas em `emptyDir` (sobrevive a reinícios do container). Para sobreviver à recriação do pod, troque por um PersistentVolumeClaim.
+
+## Considerações Operacionais
+* O Pushgateway persiste as métricas em `emptyDir` (sobrevive a reinícios do container). Se o pod for recriado, as métricas somem até a próxima execução (até 12 horas) e o `CertMonitorAbsent` dispara após 1 hora. Para evitar isso, troque o `emptyDir` por um PersistentVolumeClaim.
+* O playbook carrega todos os Secrets e ConfigMaps do cluster na memória do pod (limite de `1Gi`, prazo de `activeDeadlineSeconds: 1800`). Em clusters grandes, acompanhe o consumo e ajuste `resources.limits.memory` no CronJob. Os certificados são analisados com o filtro `community.crypto.x509_certificate_info`, que roda no próprio processo do Ansible, sem um processo por certificado.
+
+## Desenvolvimento
+Os mesmos passos do CI podem ser executados localmente:
+
+```bash
+yamllint .
+ansible-lint check-certs.yaml
+kubectl kustomize . | kubeconform -strict -summary \
+  -schema-location default \
+  -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+  -skip ImageStream,BuildConfig
+```
 
 ## Como Remover
 Para desinstalar toda a solução, incluindo a imagem compilada, execute:
