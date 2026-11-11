@@ -119,7 +119,8 @@
                                     | map(attribute='cert_info_atual', default={}))) }}
       no_log: true
 
-    # O aviso do cryptography não diz qual certificado viola a RFC; aqui cada ocorrência é identificada.
+    # Os avisos do cryptography (atributo fora do limite, número de série não positivo) não dizem qual
+    # certificado viola a RFC; aqui cada ocorrência é identificada.
     # Só metadados e atributos do subject/issuer são exibidos (já presentes nas métricas).
     - name: Listar certificados fora dos limites da RFC 5280
       ansible.builtin.debug:
@@ -140,6 +141,11 @@
                 {%- endif -%}
               {%- endfor -%}
             {%- endfor -%}
+            {%- if info.serial_number is defined and info.serial_number | int <= 0 -%}
+              {%- set _ = result.append(cert.ns ~ '/' ~ cert.name ~ ' (' ~ cert.tipo ~ ', chave ' ~ cert.key ~ ', posição ' ~ cert.indice ~ '): '
+                                        ~ 'número de série não positivo (' ~ info.serial_number ~ '), RFC 5280 exige inteiro positivo; CN = "'
+                                        ~ info.subject.commonName | default('') ~ '"') -%}
+            {%- endif -%}
           {%- endfor -%}
           {{ result }}
 

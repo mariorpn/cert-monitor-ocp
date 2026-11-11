@@ -70,9 +70,9 @@ Para testar manualmente, crie um Job a partir do CronJob:
 oc create job --from=cronjob/cert-monitor-cron cert-monitor-manual-run -n cert-monitor
 ```
 
-Para ignorar namespaces ou recursos: edite o ConfigMap `cert-monitor-exclude`, chaves `namespaces` e `nomes`, adicionando nomes exatos ou regex (ex: `kube.*`). Por padrão, os namespaces `openshift-*` são ignorados, **exceto** `openshift-config` (certificado custom da API) e `openshift-ingress` (certificado do router), que são renovados manualmente. Também são ignorados `kube-root-ca.crt` e `openshift-service-ca.crt`, pois existem em todos os namespaces e são rotacionados pela plataforma.
+Para ignorar namespaces ou recursos: edite o ConfigMap `cert-monitor-exclude`, chaves `namespaces` e `nomes`, adicionando nomes exatos ou regex (ex: `kube.*`). Por padrão, os namespaces `openshift-*` são ignorados, **exceto** `openshift-config` (certificado custom da API) e `openshift-ingress` (certificado do router), que são renovados manualmente. Também são ignorados `kube-root-ca.crt` e `openshift-service-ca.crt`, pois existem em todos os namespaces e são rotacionados pela plataforma, e os bundles `config-trusted-cabundle` / `trusted-ca-bundle`, injetados pelo OpenShift com todas as CAs públicas do sistema (CAs customizadas do cluster continuam monitoradas em `openshift-config/user-ca-bundle`).
 
-Certificados fora dos limites da RFC 5280 (ex.: `commonName` com mais de 64 bytes) continuam sendo monitorados, e são listados no log do Job pela task "Listar certificados fora dos limites da RFC 5280". No Prometheus, a busca equivalente para CN longo é `cert_not_after_timestamp_seconds{subject_cn=~".{65,}"}`.
+Certificados fora da RFC 5280 (`commonName` com mais de 64 bytes, número de série negativo ou zero) continuam sendo monitorados, e são listados no log do Job pela task "Listar certificados fora dos limites da RFC 5280". No Prometheus, a busca equivalente para CN longo é `cert_not_after_timestamp_seconds{subject_cn=~".{65,}"}`.
 
 Somente as chaves terminadas em `.crt`, `.pem`, `.cer` ou `.cert` são lidas (lista em `extensoes_certificado` no playbook).
 

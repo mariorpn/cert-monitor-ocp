@@ -14,7 +14,12 @@ data:
     - default
     - projeto-legado
   # Regex (casamento exato) dos nomes de Secret/ConfigMap ignorados em qualquer namespace.
-  # Os CAs abaixo são replicados em todos os namespaces e rotacionados pela própria plataforma.
+  # - kube-root-ca.crt / openshift-service-ca.crt: replicados em todos os namespaces e rotacionados pela plataforma.
+  # - config-trusted-cabundle / trusted-ca-bundle: bundles injetados pelo OpenShift (label
+  #   config.openshift.io/inject-trusted-cabundle) com todas as CAs públicas do sistema. CAs customizadas
+  #   do cluster continuam monitoradas na origem: openshift-config/user-ca-bundle.
   nomes: |
     - kube-root-ca\.crt
     - openshift-service-ca\.crt
+    - config-trusted-cabundle
+    - trusted-ca-bundle
