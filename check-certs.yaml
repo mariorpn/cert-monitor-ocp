@@ -11,6 +11,13 @@
       - kubernetes.io/dockercfg
       - kubernetes.io/dockerconfigjson
       - helm.sh/release.v1
+    # Só as chaves de Secret/ConfigMap com estas extensões são lidas
+    extensoes_certificado: ['.crt', '.pem', '.cer', '.cert']
+    # Limites (em bytes UTF-8) que o cryptography valida; fora deles ele só emite um UserWarning
+    limites_rfc5280:
+      commonName: [1, 64]
+      countryName: [2, 2]
+      jurisdictionCountryName: [2, 2]
     epoch_zero: '1970-01-01 00:00:00'
     pem_regex: '-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----'
 
@@ -25,17 +32,20 @@
 
     - name: Construir regex de namespaces e recursos ignorados
       ansible.builtin.set_fact:
+        # Chave ausente ou lista vazia resulta em ^$ (nada é ignorado)
         regex_ignorados: >-
           {%- set data = exclude_cm.resources[0].data | default({}) if exclude_cm.resources | length > 0 else {} -%}
-          {%- if data.namespaces is defined -%}
-            ^(?:{{ (data.namespaces | from_yaml) | join('|') }})$
+          {%- set lista = (data.namespaces | default('') | from_yaml) or [] -%}
+          {%- if lista -%}
+            ^(?:{{ lista | join('|') }})$
           {%- else -%}
             ^$
           {%- endif -%}
         regex_nomes_ignorados: >-
           {%- set data = exclude_cm.resources[0].data | default({}) if exclude_cm.resources | length > 0 else {} -%}
-          {%- if data.nomes is defined -%}
-            ^(?:{{ (data.nomes | from_yaml) | join('|') }})$
+          {%- set lista = (data.nomes | default('') | from_yaml) or [] -%}
+          {%- if lista -%}
+            ^(?:{{ lista | join('|') }})$
           {%- else -%}
             ^$
           {%- endif -%}
@@ -74,7 +84,7 @@
           {%- endfor -%}
           {%- for f in fontes if not (f.obj.metadata.namespace | regex_search(regex_ignorados))
                                 and not (f.obj.metadata.name | regex_search(regex_nomes_ignorados)) -%}
-            {%- for k, v in f.data.items() if k.endswith('.crt') or k.endswith('.pem') -%}
+            {%- for k, v in f.data.items() if (k | splitext | last) in extensoes_certificado -%}
               {%- set texto = v | b64decode if f.b64 else v -%}
               {%- for pem in texto | regex_findall(pem_regex) -%}
                 {%- set _ = result.append({'ns': f.obj.metadata.namespace, 'name': f.obj.metadata.name, 'key': k,
@@ -91,9 +101,11 @@
         pems_unicos: "{{ lista_certificados | map(attribute='pem') | unique | list }}"
       no_log: true
 
+    # O filtro roda no próprio processo do Ansible (o módulo abriria um processo por certificado).
+    # PEM inválido faz o filtro falhar; failed_when: false mantém o loop e o item fica sem ansible_facts.
     - name: Analisar a validade de cada certificado
-      community.crypto.x509_certificate_info:
-        content: "{{ item }}"
+      ansible.builtin.set_fact:
+        cert_info_atual: "{{ item | community.crypto.x509_certificate_info }}"
       loop: "{{ pems_unicos }}"
       register: cert_info_results
       failed_when: false
@@ -101,8 +113,35 @@
 
     - name: Indexar informações por certificado
       ansible.builtin.set_fact:
-        info_por_pem: "{{ dict(pems_unicos | zip(cert_info_results.results)) }}"
+        info_por_pem: >-
+          {{ dict(pems_unicos | zip(cert_info_results.results
+                                    | map(attribute='ansible_facts', default={})
+                                    | map(attribute='cert_info_atual', default={}))) }}
       no_log: true
+
+    # O aviso do cryptography não diz qual certificado viola a RFC; aqui cada ocorrência é identificada.
+    # Só metadados e atributos do subject/issuer são exibidos (já presentes nas métricas).
+    - name: Listar certificados fora dos limites da RFC 5280
+      ansible.builtin.debug:
+        msg: "{{ certificados_fora_rfc }}"
+      when: certificados_fora_rfc | length > 0
+      vars:
+        certificados_fora_rfc: >-
+          {%- set result = [] -%}
+          {%- for cert in lista_certificados -%}
+            {%- set info = info_por_pem[cert.pem] -%}
+            {%- for parte in ['subject', 'issuer'] -%}
+              {%- for attr, limite in limites_rfc5280.items() if attr in info[parte] | default({}) -%}
+                {%- set valor = info[parte][attr] -%}
+                {%- set tamanho = valor.encode('utf-8') | length -%}
+                {%- if tamanho < limite[0] or tamanho > limite[1] -%}
+                  {%- set _ = result.append(cert.ns ~ '/' ~ cert.name ~ ' (' ~ cert.tipo ~ ', chave ' ~ cert.key ~ ', posição ' ~ cert.indice ~ '): '
+                                            ~ parte ~ ' ' ~ attr ~ ' com ' ~ tamanho ~ ' bytes (RFC 5280: ' ~ limite[0] ~ '–' ~ limite[1] ~ ') = "' ~ valor ~ '"') -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ result }}
 
     # Datas ASN.1 são UTC; subtrair o epoch como datetime ingênuo evita depender do TZ do container.
     - name: Gerar payload de métricas do Prometheus
@@ -123,7 +162,7 @@
           cert_monitor_certificates {{ lista_certificados | length }}
           # HELP cert_monitor_parse_errors Certificados únicos que não puderam ser analisados
           # TYPE cert_monitor_parse_errors gauge
-          cert_monitor_parse_errors {{ cert_info_results.results | selectattr('not_after', 'undefined') | list | length }}
+          cert_monitor_parse_errors {{ info_por_pem.values() | selectattr('not_after', 'undefined') | list | length }}
           # HELP cert_monitor_last_run_timestamp_seconds Momento da última varredura concluída (epoch UTC)
           # TYPE cert_monitor_last_run_timestamp_seconds gauge
           cert_monitor_last_run_timestamp_seconds {{ (now(utc=true) - (epoch_zero | to_datetime)).total_seconds() | int }}

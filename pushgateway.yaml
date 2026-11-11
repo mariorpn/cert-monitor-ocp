@@ -45,6 +45,10 @@ spec:
         securityContext:
           runAsNonRoot: true
           allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
         volumeMounts:
         - name: data
           mountPath: /data

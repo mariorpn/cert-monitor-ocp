@@ -61,6 +61,11 @@ spec:
             env:
             - name: PUSHGATEWAY_URL
               value: "http://pushgateway.cert-monitor.svc.cluster.local:9091"
+            # Certificados fora dos limites da RFC 5280 (ex.: CN > 64 bytes) são analisados normalmente, mas o
+            # cryptography emite um UserWarning cru no stderr. O aviso é silenciado porque o playbook já lista
+            # esses certificados na task "Listar certificados fora dos limites da RFC 5280".
+            - name: PYTHONWARNINGS
+              value: "ignore:Attribute's length must be:UserWarning"
             resources:
               requests:
                 memory: "256Mi"
@@ -71,3 +76,7 @@ spec:
             securityContext:
               runAsNonRoot: true
               allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+              seccompProfile:
+                type: RuntimeDefault

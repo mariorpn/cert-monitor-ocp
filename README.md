@@ -70,7 +70,11 @@ Para testar manualmente, crie um Job a partir do CronJob:
 oc create job --from=cronjob/cert-monitor-cron cert-monitor-manual-run -n cert-monitor
 ```
 
-Para ignorar namespaces ou recursos: edite o ConfigMap `cert-monitor-exclude`, chaves `namespaces` e `nomes`, adicionando nomes exatos ou regex (ex: `openshift.*`). Por padrão, `kube-root-ca.crt` e `openshift-service-ca.crt` são ignorados, pois existem em todos os namespaces e são rotacionados pela plataforma.
+Para ignorar namespaces ou recursos: edite o ConfigMap `cert-monitor-exclude`, chaves `namespaces` e `nomes`, adicionando nomes exatos ou regex (ex: `kube.*`). Por padrão, os namespaces `openshift-*` são ignorados, **exceto** `openshift-config` (certificado custom da API) e `openshift-ingress` (certificado do router), que são renovados manualmente. Também são ignorados `kube-root-ca.crt` e `openshift-service-ca.crt`, pois existem em todos os namespaces e são rotacionados pela plataforma.
+
+Certificados fora dos limites da RFC 5280 (ex.: `commonName` com mais de 64 bytes) continuam sendo monitorados, e são listados no log do Job pela task "Listar certificados fora dos limites da RFC 5280". No Prometheus, a busca equivalente para CN longo é `cert_not_after_timestamp_seconds{subject_cn=~".{65,}"}`.
+
+Somente as chaves terminadas em `.crt`, `.pem`, `.cer` ou `.cert` são lidas (lista em `extensoes_certificado` no playbook).
 
 Secrets dos tipos `service-account-token`, `dockercfg`, `dockerconfigjson` e `helm.sh/release.v1` não são lidos (lista em `secret_types_ignorados` no playbook).
 

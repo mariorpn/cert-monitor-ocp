@@ -4,9 +4,12 @@ metadata:
   name: cert-monitor-exclude
   namespace: cert-monitor
 data:
-  # Regex (casamento exato) dos namespaces ignorados na varredura
+  # Regex (casamento exato) dos namespaces ignorados na varredura.
+  # openshift-config (certificado custom da API) e openshift-ingress (certificado do router)
+  # continuam monitorados, pois são renovados manualmente.
   namespaces: |
-    - openshift.*
+    - openshift-(?!config$|ingress$).*
+    - openshift
     - kube.*
     - default
     - projeto-legado
