@@ -5,7 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  KUBECONFORM_VERSAO: v0.6.7
+  # sha256 de kubeconform-linux-amd64.tar.gz, do arquivo CHECKSUMS da release
+  KUBECONFORM_SHA256: 95f14e87aa28c09d5941f11bd024c1d02fdc0303ccaa23f61cef67bc92619d73
+
 jobs:
+  # Mesmo id de antes para não quebrar regras de proteção de branch; roda o caderno de testes completo
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -19,17 +25,11 @@ jobs:
         run: |
           pip install yamllint ansible-lint -r requirements.txt
           ansible-galaxy collection install -r requirements.yml
-          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
+          curl -sSLo kubeconform.tar.gz "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSAO}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kubeconform.tar.gz" | sha256sum -c -
+          sudo tar xzf kubeconform.tar.gz -C /usr/local/bin kubeconform
+          rm kubeconform.tar.gz
 
-      - name: yamllint
-        run: yamllint .
-
-      - name: ansible-lint
-        run: ansible-lint check-certs.yaml
-
-      - name: kubeconform
-        run: |
-          kubectl kustomize . | ./kubeconform -strict -summary \
-            -schema-location default \
-            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
-            -skip ImageStream,BuildConfig
+      # yamllint, ansible-lint, kustomize, kubeconform, testes do playbook e das regras de alerta
+      - name: Caderno de testes (tests/run.sh)
+        run: tests/run.sh

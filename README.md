@@ -15,7 +15,8 @@ A solução integra-se à stack de monitoramento do OpenShift, gerando alertas n
 * `pushgateway.yaml`: Deployment, Service, ServiceMonitor e NetworkPolicy do Pushgateway.
 * `custom_alerts.yaml`: PrometheusRule com os alertas de expiração e de saúde do monitor.
 * `build-config.yaml`: ImageStream e BuildConfig para compilação nativa no cluster.
-* `.github/workflows/lint.yml` / `.yamllint`: CI de validação (yamllint, ansible-lint e kubeconform) e sua configuração.
+* `tests/`: caderno de testes (`CADERNO-DE-TESTES.md`), explicação detalhada de cada teste (`DETALHAMENTO-DOS-TESTES.md`), script único `run.sh`, testes do playbook (`test_playbook.py`) e das regras de alerta (`alertas.test.yaml`).
+* `.github/workflows/lint.yml` / `.yamllint`: CI que roda `tests/run.sh` e a configuração do yamllint.
 
 ## Métricas Exportadas
 | Métrica | Descrição |
@@ -101,27 +102,33 @@ Alguns certificados violam limites da RFC 5280 e continuam sendo monitorados nor
 
 Esses certificados são listados no log do Job pela task "Listar certificados fora dos limites da RFC 5280", com namespace, nome, chave e posição. Os avisos crus que a biblioteca `cryptography` emitiria no stderr são silenciados pela variável `PYTHONWARNINGS` do CronJob. No Prometheus, a busca equivalente para CN longo é `cert_not_after_timestamp_seconds{subject_cn=~".{65,}"}`.
 
+### Alerta continua depois de renovar o certificado?
+1. **Aguarde a próxima varredura ou rode um Job manual.** A varredura acontece a cada 12 horas; até lá, as métricas (e o alerta) refletem o certificado antigo. Depois de renovar, rode o Job manual (seção acima): a série antiga sai do Pushgateway e o alerta resolve em poucos minutos.
+2. **Procure outras cópias do certificado antigo.** É comum o mesmo certificado estar copiado em truststores, bundles ou Secrets de outras aplicações. Os labels do alerta (`cert_namespace`, `name`, `key`, `indice`) apontam a cópia exata, e a busca abaixo lista todas as cópias de um CN:
+   ```promql
+   cert_not_after_timestamp_seconds{subject_cn="<CN do certificado>"}
+   ```
+3. **Confira se o último Job terminou com sucesso.** Se a varredura falhar (por exemplo, por uma regex inválida no ConfigMap de exclusão ou com o Pushgateway fora do ar), nada é enviado e as métricas anteriores permanecem. Nesse caso o `CertMonitorStale` dispara depois de 26 horas.
+
 ## Considerações de Segurança
-* A ClusterRole concede `get/list` em **todos os Secrets do cluster**. Qualquer um com acesso ao token da ServiceAccount `cert-monitor-sa` consegue ler essas credenciais. Restrinja o acesso ao namespace `cert-monitor`.
+* A ClusterRole concede `get/list` em **todos os Secrets do cluster**. Qualquer um com acesso ao token da ServiceAccount `cert-monitor-sa` consegue ler essas credenciais. Restrinja o acesso ao namespace `cert-monitor`: quem pode criar pods, editar o CronJob ou rodar `oc start-build` nesse namespace consegue executar código com essa ServiceAccount, e portanto ler todos os Secrets.
 * O playbook guarda apenas os blocos `BEGIN/END CERTIFICATE`; chaves privadas nunca são extraídas, e as tasks que manipulam conteúdo de Secrets usam `no_log: true`. A task de RFC 5280 não usa `no_log`, mas exibe apenas metadados e atributos que já constam nas métricas.
 * Os containers rodam sem privilégios: `runAsNonRoot`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` e `seccompProfile: RuntimeDefault`.
-* O Pushgateway não tem autenticação; a NetworkPolicy limita o acesso ao pod do CronJob e aos namespaces de monitoramento.
+* O Pushgateway não tem autenticação; a NetworkPolicy limita o acesso ao pod do CronJob e aos namespaces de monitoramento. Quem conseguir criar pods com o label `app=cert-monitor` no namespace pode enviar métricas falsas ou vazias e, com isso, esconder alertas. É mais um motivo para restringir o namespace. O Pushgateway roda sem token de ServiceAccount (`automountServiceAccountToken: false`).
+* A extração de PEM usa uma regex linear (só base64 entre `BEGIN` e `END`), para que um ConfigMap malicioso criado em qualquer namespace monitorado não trave a varredura.
 
 ## Considerações Operacionais
 * O Pushgateway persiste as métricas em `emptyDir` (sobrevive a reinícios do container). Se o pod for recriado, as métricas somem até a próxima execução (até 12 horas) e o `CertMonitorAbsent` dispara após 1 hora. Para evitar isso, troque o `emptyDir` por um PersistentVolumeClaim.
 * O playbook carrega todos os Secrets e ConfigMaps do cluster na memória do pod (limite de `1Gi`, prazo de `activeDeadlineSeconds: 1800`). Em clusters grandes, acompanhe o consumo e ajuste `resources.limits.memory` no CronJob. Os certificados são analisados com o filtro `community.crypto.x509_certificate_info`, que roda no próprio processo do Ansible, sem um processo por certificado.
 
-## Desenvolvimento
-Os mesmos passos do CI podem ser executados localmente:
+## Testes
+Depois de qualquer alteração, siga o [caderno de testes](tests/CADERNO-DE-TESTES.md). A parte automatizada roda com um único comando, o mesmo usado no CI:
 
 ```bash
-yamllint .
-ansible-lint check-certs.yaml
-kubectl kustomize . | kubeconform -strict -summary \
-  -schema-location default \
-  -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
-  -skip ImageStream,BuildConfig
+tests/run.sh
 ```
+
+Ele executa yamllint, ansible-lint, kustomize e kubeconform; os testes do playbook (`tests/test_playbook.py`, que roda o playbook de verdade com recursos simulados e um Pushgateway local); e os testes das regras de alerta (`tests/alertas.test.yaml`, via `promtool`), inclusive o cenário de renovação de certificado. O caderno traz também o roteiro de validação no cluster, e o [detalhamento dos testes](tests/DETALHAMENTO-DOS-TESTES.md) explica cada caso: o risco coberto, como funciona e o que investigar quando falha.
 
 ## Como Remover
 Para desinstalar toda a solução, incluindo a imagem compilada, execute:

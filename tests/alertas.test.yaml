@@ -1,0 +1,121 @@
+# Testes unitários das regras de alerta (promtool test rules). Ver tests/CADERNO-DE-TESTES.md.
+# tests/run.sh extrai o spec do PrometheusRule (custom_alerts.yaml) para regras.yaml antes de rodar.
+# No promtool, time() começa em 0: o valor da série é diretamente "segundos até expirar".
+rule_files:
+  - regras.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # A01/A02: faixas de expiração (20 dias = crítico, 45 = aviso, 90 = nada)
+  - name: A01-A02 faixas de expiração
+    interval: 1m
+    input_series:
+      - series: 'cert_not_after_timestamp_seconds{cert_namespace="app",tipo="SECRET",name="c20",key="tls.crt",indice="0",subject_cn="c20",not_after="x"}'
+        values: '1728000x30'
+      - series: 'cert_not_after_timestamp_seconds{cert_namespace="app",tipo="SECRET",name="c45",key="tls.crt",indice="0",subject_cn="c45",not_after="x"}'
+        values: '3888000x30'
+      - series: 'cert_not_after_timestamp_seconds{cert_namespace="app",tipo="SECRET",name="c90",key="tls.crt",indice="0",subject_cn="c90",not_after="x"}'
+        values: '7776000x30'
+      - series: 'cert_not_after_timestamp_seconds{cert_namespace="app",tipo="SECRET",name="vencido",key="tls.crt",indice="0",subject_cn="vencido",not_after="x"}'
+        values: '-86400x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CertificateExpiringCritical
+        exp_alerts:
+          - exp_labels: {severity: critical, cert_namespace: app, tipo: SECRET, name: c20, key: tls.crt, indice: "0", subject_cn: c20, not_after: x}
+            exp_annotations:
+              summary: "Certificado expira em menos de 30 dias (ou já expirou)"
+              description: "CRÍTICO: O certificado c20 (chave tls.crt, posição 0, CN c20) no namespace app expira em 20 dias. Substitua imediatamente!"
+          - exp_labels: {severity: critical, cert_namespace: app, tipo: SECRET, name: vencido, key: tls.crt, indice: "0", subject_cn: vencido, not_after: x}
+            exp_annotations:
+              summary: "Certificado expira em menos de 30 dias (ou já expirou)"
+              description: "CRÍTICO: O certificado vencido (chave tls.crt, posição 0, CN vencido) no namespace app expira em -1 dias. Substitua imediatamente!"
+      - eval_time: 10m
+        alertname: CertificateExpiringSoon
+        exp_alerts:
+          - exp_labels: {severity: warning, cert_namespace: app, tipo: SECRET, name: c45, key: tls.crt, indice: "0", subject_cn: c45, not_after: x}
+            exp_annotations:
+              summary: "Certificado expira em menos de 60 dias"
+              description: "O certificado c45 (chave tls.crt, posição 0, CN c45) no namespace app irá expirar em 45 dias. Data Limite: x."
+
+  # A03: persistência após renovação. A série antiga (20 dias) some do Pushgateway na varredura seguinte
+  # (stale aos 31m) e a nova (400 dias, outro not_after) aparece; o alerta deve resolver.
+  - name: A03 renovação resolve o alerta
+    interval: 1m
+    input_series:
+      - series: 'cert_not_after_timestamp_seconds{cert_namespace="app",tipo="SECRET",name="web",key="tls.crt",indice="0",subject_cn="web",not_after="antigo"}'
+        values: '1728000x30 stale'
+      - series: 'cert_not_after_timestamp_seconds{cert_namespace="app",tipo="SECRET",name="web",key="tls.crt",indice="0",subject_cn="web",not_after="novo"}'
+        values: '_x30 34560000x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CertificateExpiringCritical
+        exp_alerts:
+          - exp_labels: {severity: critical, cert_namespace: app, tipo: SECRET, name: web, key: tls.crt, indice: "0", subject_cn: web, not_after: antigo}
+            exp_annotations:
+              summary: "Certificado expira em menos de 30 dias (ou já expirou)"
+              description: "CRÍTICO: O certificado web (chave tls.crt, posição 0, CN web) no namespace app expira em 20 dias. Substitua imediatamente!"
+      - eval_time: 33m
+        alertname: CertificateExpiringCritical
+        exp_alerts: []
+      - eval_time: 33m
+        alertname: CertificateExpiringSoon
+        exp_alerts: []
+
+  # A04/A05: monitor parado (última varredura há mais de 26h) e presente (sem CertMonitorAbsent)
+  - name: A04-A05 monitor parado
+    interval: 1m
+    input_series:
+      - series: 'cert_monitor_last_run_timestamp_seconds'
+        values: '0x1700'
+    alert_rule_test:
+      - eval_time: 25h
+        alertname: CertMonitorStale
+        exp_alerts: []
+      - eval_time: 27h
+        alertname: CertMonitorStale
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "Varredura de certificados atrasada"
+              description: "A última varredura concluída do cert-monitor foi há 1d 3h 0m 0s. Verifique o CronJob cert-monitor-cron."
+      - eval_time: 27h
+        alertname: CertMonitorAbsent
+        exp_alerts: []
+
+  # A06: métricas do monitor ausentes por mais de 1h
+  - name: A06 monitor ausente
+    interval: 1m
+    input_series:
+      - series: 'up{job="outro"}'
+        values: '1x90'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CertMonitorAbsent
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: CertMonitorAbsent
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "Métricas do cert-monitor ausentes"
+              description: "Nenhuma métrica do cert-monitor está sendo coletada. Verifique o Pushgateway, o ServiceMonitor e o CronJob."
+
+  # A07: certificados que não puderam ser analisados
+  - name: A07 erros de análise
+    interval: 1m
+    input_series:
+      - series: 'cert_monitor_parse_errors'
+        values: '0x5 2x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CertMonitorParseErrors
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: CertMonitorParseErrors
+        exp_alerts:
+          - exp_labels: {severity: info}
+            exp_annotations:
+              summary: "Certificados que não puderam ser analisados"
+              description: "2 certificado(s) encontrados no cluster não puderam ser analisados na última varredura."

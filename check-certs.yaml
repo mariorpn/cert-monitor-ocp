@@ -19,7 +19,9 @@
       countryName: [2, 2]
       jurisdictionCountryName: [2, 2]
     epoch_zero: '1970-01-01 00:00:00'
-    pem_regex: '-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----'
+    # Só base64 e espaços entre os marcadores: mantém a busca linear. Com [\s\S]+? um valor com muitos
+    # BEGIN sem END (ConfigMap malicioso em qualquer namespace) tinha custo quadrático e travava a varredura.
+    pem_regex: '-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+?-----END CERTIFICATE-----'
 
   tasks:
     - name: Buscar ConfigMap de exclusão
