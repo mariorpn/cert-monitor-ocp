@@ -11,13 +11,14 @@ O que cada teste cobre, como funciona e o que investigar quando falha está em [
 tests/run.sh
 ```
 
-Requisitos locais: `python3` com `ansible-core`, `cryptography` e PyYAML (`pip install -r requirements.txt yamllint ansible-lint`), as collections (`ansible-galaxy collection install -r requirements.yml`), `kubectl`. Opcionais: `kubeconform` (sem ele a etapa L04 é pulada) e `promtool`, ou então `podman`/`docker`, que usam a imagem `prom/prometheus` (sem nenhum deles, as etapas A01–A07 são puladas).
+Requisitos locais: `python3` com `ansible-core`, `cryptography` e PyYAML (`pip install -r requirements.txt yamllint ansible-lint`), as collections (`ansible-galaxy collection install -r requirements.yml`), `kubectl`. Opcionais: `kubeconform` (sem ele a etapa L04 é pulada) e `promtool`, ou então `podman`/`docker`, que usam a imagem `prom/prometheus` (sem nenhum deles, as etapas A01–A08 e D01–D02 são puladas), e `gitleaks` ou `podman`/`docker` para a etapa S01.
 
 Resultado esperado: `Todas as etapas executadas passaram.` e, no CI, nenhuma etapa pulada.
 
-### Lint e manifestos
+### Segredos, lint e manifestos
 | ID | Verifica | Esperado |
 |---|---|---|
+| S01 | Varredura de segredos com gitleaks: **todo o histórico do git** e os arquivos atuais, inclusive os não commitados | `no leaks found` nas duas varreduras |
 | L01 | `yamllint .` | Sem erros |
 | L02 | `ansible-lint check-certs.yaml` | Perfil `production` sem falhas |
 | L03 | `kubectl kustomize .` | Manifestos gerados sem erro |
@@ -51,6 +52,12 @@ O playbook roda de verdade, sem cluster: os recursos são injetados e um servido
 | P21 | Pushgateway fora do ar | Playbook falha (Job com erro), não é silencioso |
 | P22 | DoS por regex | Busca de PEM em 1 MiB malicioso em menos de 2 s |
 | P23 | ConfigMap malicioso | A varredura conclui e os demais certificados são exportados |
+| P24 | Primeira execução (Pushgateway vazio) | Nenhuma `cert_renewed_timestamp_seconds` |
+| P25 | **Certificado renovado** | `cert_renewed_timestamp_seconds` com horário ≈ agora e os mesmos labels do certificado novo; certificado inalterado e recurso novo não são marcados |
+| P26 | Renovação para validade menor | Também é detectada |
+| P27 | Bundle reordenado | Não é renovação |
+| P28 | Marcação nas varreduras seguintes | Mantida com o horário original por até 7 dias e descartada depois disso |
+| P29 | Estado anterior indisponível (HTTP 500) | Varredura e envio normais, sem marcar renovações |
 
 ### Regras de alerta (`tests/alertas.test.yaml`, via `promtool test rules`)
 | ID | Verifica | Esperado |
@@ -62,6 +69,13 @@ O playbook roda de verdade, sem cluster: os recursos são injetados e um servido
 | A05 | Monitor presente | Sem `CertMonitorAbsent` |
 | A06 | Métricas ausentes | `CertMonitorAbsent` só depois de 1h |
 | A07 | Erros de análise | `CertMonitorParseErrors` depois de 1m |
+| A08 | **Aviso de renovação** | `CertificateRenewed` ativo 1h depois da renovação e resolvido depois de 24h |
+
+### Dashboard (`grafana/cert-monitor-dashboard.json`, via `tests/dashboard_promql.py` + `promtool`)
+| ID | Verifica | Esperado |
+|---|---|---|
+| D01 | Sintaxe de todas as consultas do dashboard | `promtool check rules` sem erros |
+| D02 | Resultado das consultas principais sobre séries sintéticas | Situação (renovado > expirado > ≤ 30 > 31–60 > OK, inclusive renovado para validade curta), contadores do resumo, faixas e renovados corretos; o verde some depois de 24h |
 
 ## 2. Parte no cluster (manual)
 
@@ -80,6 +94,7 @@ Faça logo após o deploy. Use `NS=cert-monitor`.
 | C09 | NetworkPolicy: `oc run np-teste -n default --rm -i --restart=Never --image=registry.access.redhat.com/ubi9/ubi-minimal -- curl -s -m 5 http://pushgateway.cert-monitor.svc:9091/-/ready; echo rc=$?` | Falha por timeout (rc ≠ 0): pods de fora não alcançam o Pushgateway |
 | C10 | Token do Pushgateway: `oc exec -n $NS deploy/pushgateway -- ls /var/run/secrets/kubernetes.io/serviceaccount` | `No such file or directory` |
 | C11 | Secrets ignorados por tipo: `oc logs job/$JOB -n $NS` não deve mencionar secrets `kubernetes.io/service-account-token`, `dockercfg`, `dockerconfigjson` ou `helm.sh/release.v1`; e `cert_not_after_timestamp_seconds{name=~"builder-dockercfg.*\|.*-token-.*"}` deve estar vazio | Nenhuma série desses tipos |
+| C12 | Dashboard: importe `grafana/cert-monitor-dashboard.json` seguindo `grafana/README.md` | Todos os painéis carregam sem erro; o filtro Namespace lista os namespaces monitorados; os números do resumo batem com C05 |
 
 ### Roteiro C08: renovação ponta a ponta
 ```bash
@@ -102,7 +117,7 @@ oc create secret tls teste-renovacao -n $T --cert=/tmp/t.crt --key=/tmp/t.key --
 JOB=teste-$(date +%s); oc create job --from=cronjob/cert-monitor-cron $JOB -n $NS
 oc wait --for=condition=complete job/$JOB -n $NS --timeout=10m
 ```
-Esperado: `cert_not_after_timestamp_seconds{name="teste-renovacao"}` mostra **uma única** série, com o `not_after` novo, e o alerta resolve em poucos minutos.
+Esperado: `cert_not_after_timestamp_seconds{name="teste-renovacao"}` mostra **uma única** série, com o `not_after` novo, e o alerta crítico resolve em poucos minutos. `cert_renewed_timestamp_seconds{name="teste-renovacao"}` existe, o alerta `CertificateRenewed` fica `firing` e, no dashboard, a linha aparece como **✔ Renovado** (verde) na tabela Certificados e em Renovados nos últimos 7 dias.
 
 ```bash
 # 3) limpeza (as séries somem na próxima varredura)
@@ -111,6 +126,6 @@ JOB=teste-$(date +%s); oc create job --from=cronjob/cert-monitor-cron $JOB -n $N
 ```
 
 ## 3. Registro de execuções
-| Data | Commit / alteração | Automatizado | Cluster (C01–C11) | Responsável | Observações |
+| Data | Commit / alteração | Automatizado | Cluster (C01–C12) | Responsável | Observações |
 |---|---|---|---|---|---|
 | | | | | | |

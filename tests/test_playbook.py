@@ -32,7 +32,8 @@ EXCLUDE_CM = RAIZ / 'configmap-exclude.yaml'
 CRONJOB = RAIZ / 'manifestos-rbac-cronjob.yaml'
 AGORA = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
 PEM_INVALIDO = '-----BEGIN CERTIFICATE-----\nlixo\n-----END CERTIFICATE-----\n'
-CHAVE_PRIVADA = '-----BEGIN PRIVATE KEY-----\nSEGREDO-NAO-PODE-VAZAR\n-----END PRIVATE KEY-----\n'
+# Chave fictícia (P06). Montada em partes para não ser confundida com uma chave real por scanners de segredos.
+CHAVE_PRIVADA = '-----BEGIN ' + 'PRIVATE KEY-----\nSEGREDO-NAO-PODE-VAZAR\n-----END ' + 'PRIVATE KEY-----\n'
 
 
 # ---------------------------------------------------------------------------------------------
@@ -87,10 +88,12 @@ def configmap(ns, nome, dados=None, binarios=None):
 # Execução do playbook
 # ---------------------------------------------------------------------------------------------
 class Pushgateway:
-    """Servidor HTTP local que registra (método, caminho, corpo) de cada requisição."""
+    """Servidor HTTP local que registra (método, caminho, corpo) de cada requisição.
+    estado: resposta de GET /api/v1/metrics (dict, como a API do Pushgateway) ou um código HTTP de erro."""
 
-    def __init__(self):
+    def __init__(self, estado=None):
         requisicoes = self.requisicoes = []
+        estado = {'status': 'success', 'data': []} if estado is None else estado
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_PUT(self):
@@ -100,6 +103,19 @@ class Pushgateway:
                 self.end_headers()
 
             do_POST = do_PUT
+
+            def do_GET(self):
+                requisicoes.append((self.command, self.path, ''))
+                if isinstance(estado, int):
+                    self.send_response(estado)
+                    self.end_headers()
+                    return
+                corpo = json.dumps(estado).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(corpo)))
+                self.end_headers()
+                self.wfile.write(corpo)
 
             def log_message(self, *args):
                 pass
@@ -129,14 +145,20 @@ class Resultado:
         self.rc, self.saida, self.requisicoes, self.duracao = rc, saida, requisicoes, duracao
 
     @property
+    def envios(self):
+        """Requisições que alteram o Pushgateway (a leitura do estado anterior é um GET e fica de fora)."""
+        return [r for r in self.requisicoes if r[0] != 'GET']
+
+    @property
     def payload(self):
-        assert len(self.requisicoes) == 1, f'esperado 1 envio ao Pushgateway, houve {len(self.requisicoes)}'
-        return self.requisicoes[0][2]
+        assert len(self.envios) == 1, f'esperado 1 envio ao Pushgateway, houve {len(self.envios)}'
+        return self.envios[0][2]
 
 
-def executar(secrets=(), configmaps=(), exclude='padrao', pushgateway_url=None):
+def executar(secrets=(), configmaps=(), exclude='padrao', pushgateway_url=None, estado=None):
     """Roda o playbook com os recursos informados. exclude: 'padrao' (configmap-exclude.yaml do repo),
-    None (ConfigMap de exclusão ausente) ou um dict com o campo data."""
+    None (ConfigMap de exclusão ausente) ou um dict com o campo data. estado: o que o Pushgateway falso
+    devolve como varredura anterior (ver estado_api)."""
     play = yaml.safe_load(PLAYBOOK.read_text())
     play[0]['tasks'] = [t for t in play[0]['tasks'] if 'kubernetes.core.k8s_info' not in t]
     if exclude == 'padrao':
@@ -148,7 +170,7 @@ def executar(secrets=(), configmaps=(), exclude='padrao', pushgateway_url=None):
     variaveis = {'exclude_cm': exclude_cm,
                  'secrets_brutos': {'resources': list(secrets)},
                  'configmaps_brutos': {'resources': list(configmaps)}}
-    with tempfile.TemporaryDirectory() as tmp, Pushgateway() as pg:
+    with tempfile.TemporaryDirectory() as tmp, Pushgateway(estado) as pg:
         Path(tmp, 'play.yaml').write_text(yaml.safe_dump(play, allow_unicode=True, sort_keys=False))
         Path(tmp, 'vars.json').write_text(json.dumps(variaveis))
         env = dict(os.environ, PUSHGATEWAY_URL=pushgateway_url or pg.url,
@@ -200,15 +222,31 @@ def interpretar(payload):
     return series
 
 
-def certificados(series, **filtro):
+def certificados(series, metrica='cert_not_after_timestamp_seconds', **filtro):
     return [r | {'_valor': v} for n, r, v in series
-            if n == 'cert_not_after_timestamp_seconds' and all(r.get(k) == f for k, f in filtro.items())]
+            if n == metrica and all(r.get(k) == f for k, f in filtro.items())]
+
+
+def renovados(series, **filtro):
+    return certificados(series, metrica='cert_renewed_timestamp_seconds', **filtro)
 
 
 def escalar(series, nome):
     valores = [v for n, _, v in series if n == nome]
     assert len(valores) == 1, f'{nome}: {valores}'
     return valores[0]
+
+
+def estado_api(payload):
+    """Converte um payload enviado para a resposta de GET /api/v1/metrics do Pushgateway, que é o que a
+    próxima varredura lê como estado anterior. Os valores vêm como string em notação científica, como no
+    Pushgateway real, e os labels job/instance são acrescentados."""
+    grupo = {'labels': {'job': 'cert_monitor'}}
+    for nome, rotulos, valor in interpretar(payload):
+        familia = grupo.setdefault(nome, {'type': 'GAUGE', 'metrics': []})
+        familia['metrics'].append({'labels': rotulos | {'job': 'cert_monitor', 'instance': ''},
+                                   'value': f'{valor:.15e}'})
+    return {'status': 'success', 'data': [grupo]}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -259,7 +297,7 @@ class CenarioPrincipal(unittest.TestCase):
         cls.series = interpretar(cls.r.payload)
 
     def test_P01_envio_put_no_grupo_do_job(self):
-        metodo, caminho, _ = self.r.requisicoes[0]
+        metodo, caminho, _ = self.r.envios[0]
         self.assertEqual((metodo, caminho), ('PUT', '/metrics/job/cert_monitor'))
 
     def test_P02_formato_do_payload(self):
@@ -349,7 +387,7 @@ class Exclusao(unittest.TestCase):
     def test_P18_regex_invalida_falha_visivelmente(self):
         r = executar([secret('app', 'x', {'tls.crt': Cert('x').pem})], exclude={'namespaces': '- "(abc"'})
         self.assertNotEqual(r.rc, 0)
-        self.assertEqual(r.requisicoes, [])
+        self.assertEqual(r.envios, [])
 
 
 class Persistencia(unittest.TestCase):
@@ -363,7 +401,7 @@ class Persistencia(unittest.TestCase):
         self.assertEqual([s['not_after'] for s in s1], [antigo.not_after])
         self.assertEqual([s['not_after'] for s in s2], [novo.not_after])
         self.assertNotIn(antigo.not_after, r2.payload)
-        self.assertEqual(r2.requisicoes[0][0], 'PUT')  # PUT substitui o grupo inteiro no Pushgateway
+        self.assertEqual(r2.envios[0][0], 'PUT')  # PUT substitui o grupo inteiro no Pushgateway
 
     def test_P20_recurso_removido_some_das_metricas(self):
         r = executar([secret('app', 'outro', {'tls.crt': Cert('outro').pem})])
@@ -372,6 +410,69 @@ class Persistencia(unittest.TestCase):
     def test_P21_falha_no_envio_falha_o_job(self):
         r = executar([secret('app', 'web', {'tls.crt': Cert('web').pem})], pushgateway_url='http://127.0.0.1:9')
         self.assertNotEqual(r.rc, 0)
+
+
+class Renovacao(unittest.TestCase):
+    """Detecção de renovação (cert_renewed_timestamp_seconds), usando o estado anterior lido do Pushgateway."""
+
+    def varredura(self, recursos, anterior=None):
+        r = executar(recursos, estado=estado_api(anterior.payload) if anterior else None)
+        self.assertEqual(r.rc, 0, r.saida[-3000:])
+        return r, interpretar(r.payload)
+
+    def test_P24_primeira_execucao_nao_marca_nada(self):
+        _, series = self.varredura([secret('app', 'web', {'tls.crt': Cert('web').pem})])
+        self.assertTrue(certificados(series, name='web'))
+        self.assertEqual(renovados(series), [])
+
+    def test_P25_certificado_renovado_e_marcado(self):
+        estavel = Cert('estavel', dias=100)
+        r1, _ = self.varredura([secret('app', 'web', {'tls.crt': Cert('web', dias=10).pem}),
+                                secret('app', 'estavel', {'tls.crt': estavel.pem})])
+        novo = Cert('web', dias=400)
+        _, series = self.varredura([secret('app', 'web', {'tls.crt': novo.pem}),
+                                    secret('app', 'estavel', {'tls.crt': estavel.pem}),
+                                    secret('app', 'recurso-novo', {'tls.crt': Cert('novo').pem})], anterior=r1)
+        marcados = renovados(series)
+        self.assertEqual([(m['name'], m['not_after']) for m in marcados], [('web', novo.not_after)])
+        self.assertLess(abs(marcados[0]['_valor'] - time.time()), 300)
+        # Mesmo conjunto de labels da série de expiração, para junções diretas no PromQL/Grafana
+        cert = certificados(series, name='web')[0]
+        self.assertEqual({k: v for k, v in marcados[0].items() if k != '_valor'},
+                         {k: v for k, v in cert.items() if k != '_valor'})
+
+    def test_P26_renovacao_para_validade_menor(self):
+        r1, _ = self.varredura([secret('app', 'web', {'tls.crt': Cert('web', dias=300).pem})])
+        novo = Cert('web', dias=90)
+        _, series = self.varredura([secret('app', 'web', {'tls.crt': novo.pem})], anterior=r1)
+        self.assertEqual([m['not_after'] for m in renovados(series)], [novo.not_after])
+
+    def test_P27_reordenar_bundle_nao_e_renovacao(self):
+        a, b, c = Cert('a', dias=100), Cert('b', dias=200), Cert('c', dias=300)
+        r1, _ = self.varredura([secret('app', 'bundle', {'ca.crt': a.pem + b.pem + c.pem})])
+        _, series = self.varredura([secret('app', 'bundle', {'ca.crt': c.pem + a.pem + b.pem})], anterior=r1)
+        self.assertEqual(renovados(series), [])
+
+    def test_P28_marcacao_mantida_e_expirada(self):
+        r1, _ = self.varredura([secret('app', 'web', {'tls.crt': Cert('web', dias=10).pem})])
+        recursos = [secret('app', 'web', {'tls.crt': Cert('web', dias=400).pem})]
+        r2, _ = self.varredura(recursos, anterior=r1)
+        for idade, mantida in ((2 * 3600, True), (8 * 86400, False)):
+            with self.subTest(idade_horas=idade // 3600):
+                estado = estado_api(r2.payload)
+                ts = int(time.time()) - idade
+                for m in estado['data'][0]['cert_renewed_timestamp_seconds']['metrics']:
+                    m['value'] = f'{ts:.15e}'
+                r3 = executar(recursos, estado=estado)
+                marcados = renovados(interpretar(r3.payload), name='web')
+                self.assertEqual([int(m['_valor']) for m in marcados], [ts] if mantida else [])
+
+    def test_P29_estado_indisponivel_nao_impede_o_envio(self):
+        r = executar([secret('app', 'web', {'tls.crt': Cert('web').pem})], estado=500)
+        self.assertEqual(r.rc, 0, r.saida[-3000:])
+        series = interpretar(r.payload)
+        self.assertTrue(certificados(series, name='web'))
+        self.assertEqual(renovados(series), [])
 
 
 class Seguranca(unittest.TestCase):

@@ -25,6 +25,15 @@ spec:
         summary: "Certificado expira em menos de 30 dias (ou já expirou)"
         description: "CRÍTICO: O certificado {{ $labels.name }} (chave {{ $labels.key }}, posição {{ $labels.indice }}, CN {{ $labels.subject_cn }}) no namespace {{ $labels.cert_namespace }} expira em {{ $value | printf \"%.0f\" }} dias. Substitua imediatamente!"
 
+    # Informativo: ativo nas 24h seguintes à detecção da renovação e resolvido automaticamente depois disso
+    - alert: CertificateRenewed
+      expr: time() - cert_renewed_timestamp_seconds < 86400
+      labels:
+        severity: info
+      annotations:
+        summary: "Certificado renovado"
+        description: "O certificado {{ $labels.name }} (chave {{ $labels.key }}, posição {{ $labels.indice }}, CN {{ $labels.subject_cn }}) no namespace {{ $labels.cert_namespace }} foi renovado. Nova data de expiração: {{ $labels.not_after }}."
+
   - name: cert-monitor-health
     rules:
     - alert: CertMonitorStale

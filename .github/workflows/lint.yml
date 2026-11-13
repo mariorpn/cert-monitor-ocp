@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # histórico completo para a varredura de segredos (S01)
 
       - uses: actions/setup-python@v5
         with:
@@ -30,6 +32,6 @@ jobs:
           sudo tar xzf kubeconform.tar.gz -C /usr/local/bin kubeconform
           rm kubeconform.tar.gz
 
-      # yamllint, ansible-lint, kustomize, kubeconform, testes do playbook e das regras de alerta
+      # gitleaks, yamllint, ansible-lint, kustomize, kubeconform e testes do playbook, alertas e dashboard
       - name: Caderno de testes (tests/run.sh)
         run: tests/run.sh

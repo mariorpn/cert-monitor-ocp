@@ -1,4 +1,18 @@
 *.retry
 __pycache__/
 .venv/
+
+# Credenciais e material criptográfico: nunca versionar
 *.key
+*.pem
+*.crt
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.kubeconfig
+kubeconfig
+.env
+.env.*
+*.token
+vars.json

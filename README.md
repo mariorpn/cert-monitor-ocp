@@ -15,7 +15,8 @@ A solução integra-se à stack de monitoramento do OpenShift, gerando alertas n
 * `pushgateway.yaml`: Deployment, Service, ServiceMonitor e NetworkPolicy do Pushgateway.
 * `custom_alerts.yaml`: PrometheusRule com os alertas de expiração e de saúde do monitor.
 * `build-config.yaml`: ImageStream e BuildConfig para compilação nativa no cluster.
-* `tests/`: caderno de testes (`CADERNO-DE-TESTES.md`), explicação detalhada de cada teste (`DETALHAMENTO-DOS-TESTES.md`), script único `run.sh`, testes do playbook (`test_playbook.py`) e das regras de alerta (`alertas.test.yaml`).
+* `tests/`: caderno de testes (`CADERNO-DE-TESTES.md`), explicação detalhada de cada teste (`DETALHAMENTO-DOS-TESTES.md`), script único `run.sh`, testes do playbook (`test_playbook.py`), das regras de alerta (`alertas.test.yaml`) e das consultas do dashboard (`dashboard_promql.py`).
+* `grafana/`: dashboard Grafana para importar (`cert-monitor-dashboard.json`) e instruções de datasource e instalação (`README.md`).
 * `.github/workflows/lint.yml` / `.yamllint`: CI que roda `tests/run.sh` e a configuração do yamllint.
 
 ## Métricas Exportadas
@@ -24,6 +25,7 @@ A solução integra-se à stack de monitoramento do OpenShift, gerando alertas n
 | `cert_not_after_timestamp_seconds` | Data de expiração (epoch UTC). Labels: `cert_namespace`, `tipo` (`SECRET`/`CONFIGMAP`), `name`, `key`, `indice` (posição no bundle), `subject_cn`, `not_after` (formato `AAAAMMDDhhmmssZ`, UTC). |
 | `cert_monitor_certificates` | Quantidade de entradas encontradas na última varredura. O mesmo certificado presente em vários recursos ou posições conta várias vezes. |
 | `cert_monitor_parse_errors` | Certificados únicos (PEM) que não puderam ser analisados. |
+| `cert_renewed_timestamp_seconds` | Momento em que a renovação do certificado foi detectada (epoch UTC), mantido por 7 dias (`renovacao_retencao_dias`). Mesmos labels de `cert_not_after_timestamp_seconds`, referentes ao certificado novo. |
 | `cert_monitor_last_run_timestamp_seconds` | Momento da última varredura concluída (epoch UTC). |
 
 O Pushgateway acrescenta o label `job="cert_monitor"`, e o User Workload Monitoring acrescenta `namespace="cert-monitor"` (por isso o namespace do certificado fica em `cert_namespace`).
@@ -35,9 +37,20 @@ As métricas são enviadas com `PUT`, que substitui o grupo inteiro: certificado
 ## Alertas
 * `CertificateExpiringSoon` (warning): expira entre 30 e 60 dias (`for: 1m`).
 * `CertificateExpiringCritical` (critical): expira em 30 dias ou menos, inclusive já expirados (`for: 1m`).
+* `CertificateRenewed` (info): certificado renovado, ativo nas 24 horas seguintes à detecção e resolvido automaticamente.
 * `CertMonitorStale` (warning): nenhuma varredura concluída nas últimas 26 horas (`for: 10m`). Com o agendamento de 12 em 12 horas, tolera uma execução perdida.
 * `CertMonitorAbsent` (warning): métricas do monitor ausentes (`for: 1h`).
 * `CertMonitorParseErrors` (info): certificados que não puderam ser analisados (`for: 1m`).
+
+### Detecção de renovação
+A cada varredura, o playbook lê no Pushgateway o resultado da varredura anterior (`GET /api/v1/metrics`) e compara as datas de expiração. Um certificado com uma data de expiração que não existia antes, numa chave já monitorada (mesmo namespace, tipo, nome e chave), é considerado **renovado**: gera `cert_renewed_timestamp_seconds` e o alerta `CertificateRenewed`, e fica verde no dashboard por 24 horas.
+
+* A detecção acontece na varredura seguinte à renovação (até 12 horas, ou na hora com um Job manual).
+* Recurso novo não conta como renovação, e reordenar um bundle também não. Incluir um certificado novo num bundle existente conta como renovação daquela chave.
+* Se o estado anterior não estiver disponível (primeira execução, Pushgateway recriado ou indisponível na leitura), nenhuma renovação é marcada nessa varredura; as métricas de expiração não são afetadas.
+
+## Dashboard Grafana
+O diretório [`grafana/`](grafana/README.md) traz um dashboard pronto para importar, com resumo, tabela de certificados com a situação de cada um, renovações dos últimos 7 dias, faixas de vencimento e saúde do monitor. Os certificados renovados ficam **verdes por 24 horas**. O guia explica como criar a credencial e o datasource apontando para o Thanos Querier do OpenShift.
 
 ## Pré-requisitos
 * OpenShift 4.x com o User Workload Monitoring habilitado (ver passo 1 abaixo).
@@ -115,6 +128,7 @@ Esses certificados são listados no log do Job pela task "Listar certificados fo
 * O playbook guarda apenas os blocos `BEGIN/END CERTIFICATE`; chaves privadas nunca são extraídas, e as tasks que manipulam conteúdo de Secrets usam `no_log: true`. A task de RFC 5280 não usa `no_log`, mas exibe apenas metadados e atributos que já constam nas métricas.
 * Os containers rodam sem privilégios: `runAsNonRoot`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` e `seccompProfile: RuntimeDefault`.
 * O Pushgateway não tem autenticação; a NetworkPolicy limita o acesso ao pod do CronJob e aos namespaces de monitoramento. Quem conseguir criar pods com o label `app=cert-monitor` no namespace pode enviar métricas falsas ou vazias e, com isso, esconder alertas. É mais um motivo para restringir o namespace. O Pushgateway roda sem token de ServiceAccount (`automountServiceAccountToken: false`).
+* O repositório é verificado contra vazamento de segredos: o `tests/run.sh` (e, portanto, o CI) roda o gitleaks sobre todo o histórico do git e sobre os arquivos atuais (etapa S01), e o `.gitignore` bloqueia arquivos típicos de credenciais (`*.key`, `*.pem`, `*.crt`, `*.p12`, kubeconfig, `.env`, `*.token`). Nunca commite credenciais: se acontecer, revogue-as, porque elas continuam no histórico publicado.
 * A extração de PEM usa uma regex linear (só base64 entre `BEGIN` e `END`), para que um ConfigMap malicioso criado em qualquer namespace monitorado não trave a varredura.
 
 ## Considerações Operacionais
@@ -128,7 +142,7 @@ Depois de qualquer alteração, siga o [caderno de testes](tests/CADERNO-DE-TEST
 tests/run.sh
 ```
 
-Ele executa yamllint, ansible-lint, kustomize e kubeconform; os testes do playbook (`tests/test_playbook.py`, que roda o playbook de verdade com recursos simulados e um Pushgateway local); e os testes das regras de alerta (`tests/alertas.test.yaml`, via `promtool`), inclusive o cenário de renovação de certificado. O caderno traz também o roteiro de validação no cluster, e o [detalhamento dos testes](tests/DETALHAMENTO-DOS-TESTES.md) explica cada caso: o risco coberto, como funciona e o que investigar quando falha.
+Ele executa a varredura de segredos (gitleaks), yamllint, ansible-lint, kustomize e kubeconform; os testes do playbook (`tests/test_playbook.py`, que roda o playbook de verdade com recursos simulados e um Pushgateway local); os testes das regras de alerta (`tests/alertas.test.yaml`, via `promtool`), inclusive o cenário de renovação de certificado; e os testes das consultas do dashboard (sintaxe e resultado, via `promtool`). O caderno traz também o roteiro de validação no cluster, e o [detalhamento dos testes](tests/DETALHAMENTO-DOS-TESTES.md) explica cada caso: o risco coberto, como funciona e o que investigar quando falha.
 
 ## Como Remover
 Para desinstalar toda a solução, incluindo a imagem compilada, execute:

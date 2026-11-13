@@ -18,6 +18,8 @@
       commonName: [1, 64]
       countryName: [2, 2]
       jurisdictionCountryName: [2, 2]
+    # Por quanto tempo a marcação de renovação (cert_renewed_timestamp_seconds) é mantida
+    renovacao_retencao_dias: 7
     epoch_zero: '1970-01-01 00:00:00'
     # Só base64 e espaços entre os marcadores: mantém a busca linear. Com [\s\S]+? um valor com muitos
     # BEGIN sem END (ConfigMap malicioso em qualquer namespace) tinha custo quadrático e travava a varredura.
@@ -151,6 +153,56 @@
           {%- endfor -%}
           {{ result }}
 
+    # O estado da varredura anterior fica no próprio Pushgateway. Sem ele (primeira execução, Pushgateway
+    # recriado ou indisponível) nenhuma renovação é detectada; uma falha real aparece no envio (PUT).
+    - name: Ler o estado anterior no Pushgateway
+      ansible.builtin.uri:
+        url: "{{ pushgateway_url }}/api/v1/metrics"
+        timeout: 30
+      register: estado_anterior
+      failed_when: false
+      no_log: true
+
+    - name: Registrar o horário da varredura
+      ansible.builtin.set_fact:
+        agora_epoch: "{{ (now(utc=true) - (epoch_zero | to_datetime)).total_seconds() | int }}"
+
+    # Renovado = certificado com uma data de expiração que não existia, na varredura anterior, na mesma chave
+    # (namespace, tipo, nome, chave) já monitorada. Recurso novo não conta; reordenar um bundle também não.
+    # Marcações anteriores são mantidas com o horário original por renovacao_retencao_dias.
+    - name: Detectar certificados renovados
+      ansible.builtin.set_fact:
+        renovacoes: >-
+          {%- set grupo = (estado_anterior.json | default({})).data | default([])
+                          | selectattr('labels.job', 'defined') | selectattr('labels.job', 'equalto', 'cert_monitor')
+                          | first | default({}) -%}
+          {%- set vistos = {} -%}
+          {%- for m in (grupo.cert_not_after_timestamp_seconds | default({})).metrics | default([]) -%}
+            {%- set g = [m.labels['cert_namespace'], m.labels['tipo'], m.labels['name'], m.labels['key']] | join('|') -%}
+            {%- set _ = vistos.update({g: (vistos[g] | default([])) + [m.labels['not_after']]}) -%}
+          {%- endfor -%}
+          {%- set marcas = {} -%}
+          {%- for m in (grupo.cert_renewed_timestamp_seconds | default({})).metrics | default([]) -%}
+            {%- set _ = marcas.update({[m.labels['cert_namespace'], m.labels['tipo'], m.labels['name'], m.labels['key'],
+                                        m.labels['subject_cn'], m.labels['not_after']] | join('|'): m['value'] | float | int}) -%}
+          {%- endfor -%}
+          {%- set result = [] -%}
+          {%- for cert in lista_certificados if info_por_pem[cert.pem].not_after is defined -%}
+            {%- set res = info_por_pem[cert.pem] -%}
+            {%- set cn = (res.subject.commonName | default('')) | replace('\n', ' ') -%}
+            {%- set g = [cert.ns, cert.tipo, cert.name, cert.key] | join('|') -%}
+            {%- set marca = [g, cn, res.not_after] | join('|') -%}
+            {%- set item = {'ns': cert.ns, 'tipo': cert.tipo, 'name': cert.name, 'key': cert.key,
+                            'indice': cert.indice, 'cn': cn, 'not_after': res.not_after} -%}
+            {%- if g in vistos and res.not_after not in vistos[g] -%}
+              {%- set _ = result.append(item | combine({'ts': agora_epoch | int})) -%}
+            {%- elif marca in marcas and (agora_epoch | int) - marcas[marca] < renovacao_retencao_dias * 86400 -%}
+              {%- set _ = result.append(item | combine({'ts': marcas[marca]})) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ result }}
+      no_log: true
+
     # Datas ASN.1 são UTC; subtrair o epoch como datetime ingênuo evita depender do TZ do container.
     - name: Gerar payload de métricas do Prometheus
       ansible.builtin.set_fact:
@@ -165,6 +217,12 @@
           cert_not_after_timestamp_seconds{cert_namespace="{{ cert.ns }}",tipo="{{ cert.tipo }}",name="{{ cert.name }}",key="{{ cert.key }}",indice="{{ cert.indice }}",subject_cn="{{ cn }}",not_after="{{ res.not_after }}"} {{ expiracao }}
           {% endif %}
           {% endfor %}
+          # HELP cert_renewed_timestamp_seconds Momento em que a renovação do certificado foi detectada (epoch UTC)
+          # TYPE cert_renewed_timestamp_seconds gauge
+          {% for r in renovacoes %}
+          {% set cn = r.cn | replace('\\', '\\\\') | replace('"', '\\"') %}
+          cert_renewed_timestamp_seconds{cert_namespace="{{ r.ns }}",tipo="{{ r.tipo }}",name="{{ r.name }}",key="{{ r.key }}",indice="{{ r.indice }}",subject_cn="{{ cn }}",not_after="{{ r.not_after }}"} {{ r.ts }}
+          {% endfor %}
           # HELP cert_monitor_certificates Certificados encontrados na última varredura
           # TYPE cert_monitor_certificates gauge
           cert_monitor_certificates {{ lista_certificados | length }}
@@ -173,7 +231,7 @@
           cert_monitor_parse_errors {{ info_por_pem.values() | selectattr('not_after', 'undefined') | list | length }}
           # HELP cert_monitor_last_run_timestamp_seconds Momento da última varredura concluída (epoch UTC)
           # TYPE cert_monitor_last_run_timestamp_seconds gauge
-          cert_monitor_last_run_timestamp_seconds {{ (now(utc=true) - (epoch_zero | to_datetime)).total_seconds() | int }}
+          cert_monitor_last_run_timestamp_seconds {{ agora_epoch }}
       no_log: true
 
     # PUT substitui o grupo inteiro: certificados removidos do cluster somem do Pushgateway.

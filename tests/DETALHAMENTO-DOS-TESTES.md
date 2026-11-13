@@ -5,12 +5,13 @@ Este documento explica **cada teste** do [caderno de testes](CADERNO-DE-TESTES.m
 ## Sumário
 1. [Visão geral da suíte](#1-visão-geral-da-suíte)
 2. [Como a suíte funciona por dentro](#2-como-a-suíte-funciona-por-dentro)
-3. [Lint e manifestos (L01–L04)](#3-lint-e-manifestos-l01l04)
-4. [Testes do playbook (P01–P23)](#4-testes-do-playbook-p01p23)
-5. [Testes das regras de alerta (A01–A07)](#5-testes-das-regras-de-alerta-a01a07)
-6. [Testes no cluster (C01–C11)](#6-testes-no-cluster-c01c11)
-7. [Evidência de que os testes detectam regressões](#7-evidência-de-que-os-testes-detectam-regressões)
-8. [Como executar só uma parte e como adicionar testes](#8-como-executar-só-uma-parte-e-como-adicionar-testes)
+3. [Segredos, lint e manifestos (S01, L01–L04)](#3-segredos-lint-e-manifestos-s01-l01l04)
+4. [Testes do playbook (P01–P29)](#4-testes-do-playbook-p01p29)
+5. [Testes das regras de alerta (A01–A08)](#5-testes-das-regras-de-alerta-a01a08)
+6. [Testes do dashboard (D01–D02)](#6-testes-do-dashboard-d01d02)
+7. [Testes no cluster (C01–C12)](#7-testes-no-cluster-c01c12)
+8. [Evidência de que os testes detectam regressões](#8-evidência-de-que-os-testes-detectam-regressões)
+9. [Como executar só uma parte e como adicionar testes](#9-como-executar-só-uma-parte-e-como-adicionar-testes)
 
 ---
 
@@ -18,10 +19,12 @@ Este documento explica **cada teste** do [caderno de testes](CADERNO-DE-TESTES.m
 
 | Camada | IDs | Ferramenta | Onde roda | O que garante |
 |---|---|---|---|---|
+| Segredos | S01 | gitleaks | Local e CI | Nenhuma senha, token ou chave no histórico do git nem nos arquivos atuais |
 | Lint e manifestos | L01–L04 | yamllint, ansible-lint, kustomize, kubeconform | Local e CI | Os arquivos são válidos e os manifestos são aceitos pela API |
-| Playbook | P01–P23 | `tests/test_playbook.py` (unittest + ansible-playbook) | Local e CI | A varredura extrai, filtra, analisa e envia as métricas corretamente |
-| Regras de alerta | A01–A07 | `tests/alertas.test.yaml` (promtool) | Local e CI | Os alertas disparam, não disparam e **resolvem** nas condições certas |
-| Cluster | C01–C11 | `oc` + console | Manual, após deploy | Integração real: RBAC, NetworkPolicy, coleta, Alertmanager |
+| Playbook | P01–P29 | `tests/test_playbook.py` (unittest + ansible-playbook) | Local e CI | A varredura extrai, filtra, analisa e envia as métricas corretamente |
+| Regras de alerta | A01–A08 | `tests/alertas.test.yaml` (promtool) | Local e CI | Os alertas disparam, não disparam e **resolvem** nas condições certas |
+| Dashboard | D01–D02 | `tests/dashboard_promql.py` (promtool) | Local e CI | As consultas do dashboard são válidas e calculam a situação, os contadores e o verde por 24h corretamente |
+| Cluster | C01–C12 | `oc` + console | Manual, após deploy | Integração real: RBAC, NetworkPolicy, coleta, Alertmanager |
 
 O ponto de entrada automatizado é `tests/run.sh`. Ele executa as camadas em ordem, continua mesmo se uma etapa falhar (para mostrar todos os problemas de uma vez) e termina com um resumo: etapas puladas por falta de ferramenta e etapas que falharam. O código de saída é diferente de zero se qualquer etapa falhar, e é isso que reprova o CI.
 
@@ -33,9 +36,9 @@ O ponto de entrada automatizado é `tests/run.sh`. Ele executa as camadas em ord
 A função `executar()` (em `test_playbook.py`):
 1. Lê o `check-certs.yaml` **do repositório** e remove as tasks `kubernetes.core.k8s_info`, as únicas que falam com o cluster.
 2. Injeta via `-e @vars.json` as variáveis que essas tasks produziriam: `exclude_cm`, `secrets_brutos` e `configmaps_brutos`. Assim, todo o resto do playbook (extração, filtros, análise, relatório RFC, payload, envio) roda sem alteração.
-3. Sobe um **Pushgateway falso** (`class Pushgateway`), um servidor HTTP em `127.0.0.1` numa porta livre que registra método, caminho e corpo de cada requisição.
+3. Sobe um **Pushgateway falso** (`class Pushgateway`), um servidor HTTP em `127.0.0.1` numa porta livre que registra método, caminho e corpo de cada requisição. Ele também responde `GET /api/v1/metrics`, que é a leitura do estado da varredura anterior: por padrão devolve um Pushgateway vazio, e os testes de renovação passam um estado montado por `estado_api()` (seção 2.3) ou um código de erro HTTP.
 4. Roda `ansible-playbook` com `PUSHGATEWAY_URL` apontando para o servidor falso e com o `PYTHONWARNINGS` **lido do CronJob** (`manifestos-rbac-cronjob.yaml`). Se alguém alterar o filtro no manifesto, o teste usa o valor alterado.
-5. Devolve `Resultado`: código de saída, saída completa (stdout + stderr), requisições recebidas e duração.
+5. Devolve `Resultado`: código de saída, saída completa (stdout + stderr), requisições recebidas e duração. `Resultado.envios` são só as requisições que alteram o Pushgateway (o PUT), sem a leitura do estado; `Resultado.payload` é o corpo do único envio.
 
 Por padrão, as exclusões vêm do `configmap-exclude.yaml` **real** do repositório (`exclude='padrao'`). Os testes de exclusão validam, portanto, a configuração que vai para produção, e não uma cópia.
 
@@ -53,16 +56,36 @@ A função `interpretar()` lê o texto enviado ao Pushgateway e:
 - **falha em série duplicada**: o Pushgateway rejeita o envio inteiro quando duas linhas têm o mesmo nome e os mesmos rótulos;
 - **falha em métrica sem `# HELP` e `# TYPE`**.
 
-`certificados(series, **filtro)` devolve as séries de `cert_not_after_timestamp_seconds` que casam com os rótulos pedidos. `escalar(series, nome)` devolve o valor de uma métrica única, como `cert_monitor_parse_errors`.
+`certificados(series, **filtro)` devolve as séries de `cert_not_after_timestamp_seconds` que casam com os rótulos pedidos, e `renovados(series, **filtro)` faz o mesmo com `cert_renewed_timestamp_seconds`. `escalar(series, nome)` devolve o valor de uma métrica única, como `cert_monitor_parse_errors`.
+
+`estado_api(payload)` faz o caminho inverso: converte o payload de uma varredura na resposta que o Pushgateway real daria em `GET /api/v1/metrics`, com o grupo `job=cert_monitor`, os labels `job`/`instance` acrescentados e os valores como string em notação científica. É assim que os testes encadeiam duas varreduras: a segunda recebe como estado anterior o que a primeira enviou.
 
 ### 2.4 Regras de alerta
 O `promtool` não lê o objeto `PrometheusRule` do Kubernetes, só o formato de regras do Prometheus. O `run.sh` extrai o campo `spec` do `custom_alerts.yaml` para um arquivo temporário `regras.yaml`, roda `promtool check rules` (sintaxe) e depois `promtool test rules` (comportamento). Assim, as regras testadas são sempre as do repositório.
 
 No promtool, o relógio começa em `time() = 0`. Por isso, nos testes, o valor da série `cert_not_after_timestamp_seconds` é diretamente "segundos até expirar" (por exemplo, 20 dias = `1728000`). O `promtool` v3 compara também as **anotações**, então os testes verificam o texto final que chega ao Alertmanager.
 
+### 2.5 Consultas do dashboard
+O `tests/dashboard_promql.py` lê o `grafana/cert-monitor-dashboard.json` **do repositório**, troca as variáveis do Grafana (`$namespace`, `$tipo`) por `.*` e gera dois arquivos temporários:
+- `regras-dashboard.yaml`: cada consulta do dashboard vira uma regra de gravação, para o `promtool check rules` validar a sintaxe (D01);
+- `dashboard.test.yaml`: as consultas principais, identificadas pelo **título do painel e pelo `refId`**, são avaliadas pelo `promtool test rules` (`promql_expr_test`) sobre séries sintéticas, comparando com o resultado esperado (D02).
+
+Como as consultas são lidas do JSON, qualquer edição no dashboard é testada automaticamente. Se um painel testado for renomeado ou removido, o script avisa quais consultas não encontrou.
+
 ---
 
-## 3. Lint e manifestos (L01–L04)
+## 3. Segredos, lint e manifestos (S01, L01–L04)
+
+### S01: varredura de segredos (gitleaks)
+- **Por que existe:** o playbook lida com Secrets do cluster, e o repositório já está publicado no GitHub. Um token, senha, kubeconfig ou chave commitado por engano fica exposto **para sempre no histórico**, mesmo que o arquivo seja apagado depois.
+- **Como funciona:** o gitleaks (binário local ou a imagem `ghcr.io/gitleaks/gitleaks` com tag fixa, via podman/docker) roda duas varreduras com `--redact`, para que os valores encontrados apareçam mascarados no log:
+  - `gitleaks git`: todos os commits do histórico. No CI, o checkout usa `fetch-depth: 0` para trazer o histórico completo;
+  - `gitleaks dir`: os arquivos atuais, inclusive os ainda não commitados, para pegar o vazamento **antes** do commit.
+- **Passa quando:** as duas varreduras terminam com `no leaks found`.
+- **Se falhar:** o log mostra a regra (`RuleID`), o arquivo, a linha e o commit, com o valor mascarado. **Se for um segredo real, trate como incidente:** revogue ou troque a credencial imediatamente. Remover o arquivo não basta, porque o valor continua no histórico publicado. Se for um falso positivo (um dado de teste, por exemplo), ajuste o dado para não parecer um segredo, como foi feito com a chave fictícia do P06, ou registre a impressão digital (`Fingerprint`) num arquivo `.gitleaksignore`.
+
+Complementa o `.gitignore`, que já impede versionar por engano arquivos típicos de credenciais (`*.key`, `*.pem`, `*.crt`, `*.p12`, `*.pfx`, `*.jks`, kubeconfig, `.env`, `*.token`).
+
 
 ### L01: yamllint
 - **Por que existe:** YAML com indentação errada, chaves duplicadas ou valores ambíguos (`yes`/`no` virando booleano) quebra manifestos e o playbook de forma silenciosa.
@@ -90,7 +113,7 @@ No promtool, o relógio começa em `time() = 0`. Por isso, nos testes, o valor d
 
 ---
 
-## 4. Testes do playbook (P01–P23)
+## 4. Testes do playbook (P01–P29)
 
 ### Cenário principal (P01–P16)
 Os testes P01 a P16 compartilham **uma única execução** do playbook (`CenarioPrincipal.setUpClass`), com um conjunto de recursos que exercita todos os caminhos ao mesmo tempo. Isso deixa a suíte rápida (cerca de 10 s no total). Se essa execução falhar, todos os testes do cenário aparecem como `ERROR: setUpClass`, com o fim do log do Ansible na mensagem.
@@ -256,9 +279,48 @@ Recursos do cenário principal:
 - **Passa quando:** o playbook termina com sucesso, o certificado válido é exportado e a execução leva menos de 120 s.
 - **Se falhar:** veja o P22. Se só o tempo estourou, verifique a máquina (CPU) antes de concluir que houve regressão.
 
+### Renovação (P24–P29)
+Testam a detecção de renovação, que alimenta `cert_renewed_timestamp_seconds`, o alerta `CertificateRenewed` e o verde por 24h do dashboard. Cada teste encadeia varreduras: a seguinte recebe como estado anterior (`GET /api/v1/metrics`) o que a anterior enviou, via `estado_api()`.
+
+#### P24: Primeira execução não marca nada
+- **Risco coberto:** no primeiro deploy, ou depois de o pod do Pushgateway ser recriado, não há estado anterior. Se a ausência de estado fosse tratada como "tudo mudou", todos os certificados do cluster apareceriam como renovados e o alerta informativo dispararia para cada um.
+- **Como funciona:** uma varredura com o Pushgateway falso vazio.
+- **Passa quando:** o certificado é exportado normalmente e não há nenhuma série `cert_renewed_timestamp_seconds`.
+- **Se falhar:** confira a condição "a chave já existia" (`g in vistos`) na task "Detectar certificados renovados".
+
+#### P25: Certificado renovado é marcado
+- **Risco coberto:** é a funcionalidade principal. Além de detectar a renovação, a regra não pode marcar o que não foi renovado.
+- **Como funciona:** a primeira varredura tem `app/web` (10 dias) e `app/estavel` (100 dias). Na segunda, `app/web` tem um certificado novo de 400 dias, `app/estavel` está igual e surge `app/recurso-novo`.
+- **Passa quando:** só `app/web` é marcado, com o `not_after` novo e horário ≈ agora (diferença menor que 300 s). Os labels da série de renovação são **idênticos** aos da série de expiração do certificado novo, o que garante as junções do dashboard (`and`, *Merge*).
+- **Se falhar:** se nada foi marcado, a leitura do estado não está funcionando (URL, formato da API, `selectattr` do grupo `job=cert_monitor`). Se `estavel` ou `recurso-novo` foram marcados, a regra de comparação mudou. Se os labels diferem, compare o template de `cert_renewed_timestamp_seconds` com o de `cert_not_after_timestamp_seconds`.
+
+#### P26: Renovação para validade menor
+- **Risco coberto:** uma regra ingênua ("a data de expiração aumentou") não detectaria a troca de um certificado de 1 ano por um de 90 dias feita com antecedência.
+- **Como funciona:** 300 dias na primeira varredura, 90 dias na segunda.
+- **Passa quando:** o certificado de 90 dias é marcado.
+- **Se falhar:** a regra passou a comparar valores ("maior que") em vez de "data que não existia antes".
+
+#### P27: Reordenar um bundle não é renovação
+- **Risco coberto:** ferramentas que regeneram bundles podem mudar a ordem dos certificados sem trocar nenhum. Uma comparação por posição (`indice`) daria falso positivo.
+- **Como funciona:** o bundle tem `a`, `b` e `c` e passa a ter `c`, `a` e `b`.
+- **Passa quando:** nada é marcado.
+- **Se falhar:** a chave de comparação passou a incluir `indice`. Ela deve ser `(namespace, tipo, nome, chave)`.
+
+#### P28: Marcação mantida e descartada
+- **Risco coberto:** a renovação só é detectada uma vez, na varredura seguinte à troca. Se a marcação não fosse reenviada nas varreduras posteriores, o verde e o alerta sumiriam depois de 12 horas, e não de 24. Por outro lado, marcações antigas não podem se acumular para sempre.
+- **Como funciona:** depois de uma renovação, o estado anterior é ajustado para dizer que ela aconteceu há 2 horas (subteste 1) ou há 8 dias (subteste 2), e uma nova varredura roda com os mesmos recursos.
+- **Passa quando:** com 2 horas, a marcação é reenviada com o **horário original**; com 8 dias, ela é descartada (`renovacao_retencao_dias: 7`).
+- **Se falhar:** confira o ramo `elif marca in marcas` e a comparação com `renovacao_retencao_dias`. Um horário diferente do original indica que a marcação está sendo recriada com o horário atual.
+
+#### P29: Estado anterior indisponível não impede o envio
+- **Risco coberto:** a leitura do estado é um recurso adicional e não pode derrubar a função principal (exportar as datas de expiração) se o Pushgateway responder com erro na leitura.
+- **Como funciona:** o Pushgateway falso responde HTTP 500 ao GET e aceita o PUT normalmente.
+- **Passa quando:** o playbook termina com sucesso, o certificado é exportado e nada é marcado como renovado.
+- **Se falhar:** confira o `failed_when: false` da task "Ler o estado anterior no Pushgateway" e o tratamento de `estado_anterior.json` ausente.
+
 ---
 
-## 5. Testes das regras de alerta (A01–A07)
+## 5. Testes das regras de alerta (A01–A08)
 
 Todos usam `evaluation_interval: 1m` e séries com uma amostra por minuto, como na coleta real (a cada 30 s). Amostras mais espaçadas que 5 min criam buracos na janela do Prometheus e impedem o `for` de completar. Isso aconteceu durante a criação do A04 e foi corrigido no teste, não na regra.
 
@@ -302,9 +364,36 @@ Todos usam `evaluation_interval: 1m` e séries com uma amostra por minuto, como 
 - **Como funciona:** `cert_monitor_parse_errors` vale 0 por 5 min e depois 2.
 - **Passa quando:** aos 4 min não há alerta; aos 10 min `CertMonitorParseErrors` está ativo, com "2 certificado(s)" no texto.
 
+#### A08: Aviso de renovação por 24h
+- **Risco coberto:** o alerta `CertificateRenewed` precisa avisar sobre a renovação e **resolver sozinho**. Se ele nunca resolvesse, viraria ruído permanente no Alertmanager.
+- **Como funciona:** `cert_renewed_timestamp_seconds` vale 0, ou seja, a renovação foi detectada no instante 0.
+- **Passa quando:** à 1h o alerta está ativo, com `severity=info`, todos os labels do certificado e o texto "foi renovado. Nova data de expiração: …"; às 25h não há alerta.
+- **Se falhar:** confira a expressão `time() - cert_renewed_timestamp_seconds < 86400`. Se o texto mudou de propósito, atualize as anotações esperadas.
+
 ---
 
-## 6. Testes no cluster (C01–C11)
+## 6. Testes do dashboard (D01–D02)
+
+#### D01: Sintaxe das consultas
+- **Risco coberto:** uma consulta com erro de sintaxe só seria percebida ao abrir o dashboard, com o painel mostrando erro.
+- **Como funciona:** todas as consultas do JSON (18 hoje) são validadas pelo `promtool check rules` (seção 2.5).
+- **Passa quando:** `SUCCESS: N rules found`.
+- **Se falhar:** a mensagem do promtool indica a regra `dashboard:consulta_N`. A ordem segue a ordem dos painéis no JSON.
+
+#### D02: Resultado das consultas
+- **Risco coberto:** consultas válidas mas com lógica errada, como uma faixa de dias trocada, um contador que ignora renovados, ou a coluna Situação mostrando "Expirado" para um certificado que acabou de ser renovado. São erros silenciosos: o dashboard carrega, mas mostra a informação errada.
+- **Como funciona:** séries sintéticas com seis certificados: `renovado` (400 dias, renovado no instante 0), `renovado_curto` (20 dias, renovado no instante 0), `expirado` (-1 dia), `c20`, `c45` e `c200`. As consultas são avaliadas em 1h.
+- **Passa quando:**
+  - **Situação:** 4 para os dois renovados, 3 para `expirado`, 2 para `c20`, 1 para `c45` e 0 para `c200`. O `renovado_curto` prova que o verde prevalece mesmo quando o certificado novo ainda está na faixa de 30 dias;
+  - **resumo:** Expirados 1, ≤ 30 dias 2, 31–60 dias 1, Renovados 24h 2, Última varredura 3600 s;
+  - **Renovados nos últimos 7 dias:** horas desde a renovação = 1 e a nova expiração correta para os dois renovados;
+  - **faixas:** 1, 2, 1, 0 e 2. A faixa vazia retorna 0, e não "sem dados", graças ao `or vector(0)`;
+  - num segundo cenário, avaliado às **25h**, a Situação volta a 0 e o contador de renovados volta a 0: **o verde dura 24h**.
+- **Se falhar:** o promtool mostra o esperado e o obtido. Se a mudança no dashboard foi intencional, ajuste os valores esperados em `tests/dashboard_promql.py`.
+
+---
+
+## 7. Testes no cluster (C01–C12)
 
 Validam o que os testes automatizados não alcançam: a integração com o OpenShift real. Faça-os após cada deploy relevante (mudança de imagem, de manifestos ou de alertas).
 
@@ -317,28 +406,34 @@ Validam o que os testes automatizados não alcançam: a integração com o OpenS
 | C05 | **Métricas chegando ao Prometheus.** Valida ServiceMonitor, User Workload Monitoring e NetworkPolicy na direção da coleta. | `CertMonitorAbsent` deve estar ativo. Verifique o ServiceMonitor e o target em Observe → Targets. |
 | C06 | **Sem séries concorrentes por posição.** Se o PUT parar de substituir o grupo, as séries de certificados renovados se acumulam e aparecem aqui. Equivale ao P19 em produção. | Confira o método de envio e se há outro job enviando para o mesmo grupo. |
 | C07 | **Regras carregadas.** As 5 regras aparecem sem erro de avaliação. | `oc get prometheusrule -n cert-monitor -o yaml` e os logs do Thanos Ruler/Prometheus do UWM. |
-| C08 | **Renovação ponta a ponta.** O cenário que originou estes testes: o alerta dispara com um certificado de 10 dias e **resolve** depois da troca por um de 400 dias e de uma nova varredura. Integra P19 + A03 + Alertmanager. | Se o alerta não resolve: veja C06 (séries acumuladas), confira se o Job da renovação terminou e procure outras cópias com `cert_not_after_timestamp_seconds{subject_cn="teste-renovacao"}`. |
+| C08 | **Renovação ponta a ponta.** O cenário que originou estes testes: o alerta dispara com um certificado de 10 dias e **resolve** depois da troca por um de 400 dias e de uma nova varredura. Integra P19 + A03 + Alertmanager. Depois da renovação, deve aparecer também `cert_renewed_timestamp_seconds`, o alerta `CertificateRenewed` deve ficar ativo e a linha deve ficar verde (✔ Renovado) no dashboard, o que integra P25 + A08 + D02. | Se o alerta não resolve: veja C06 (séries acumuladas), confira se o Job da renovação terminou e procure outras cópias com `cert_not_after_timestamp_seconds{subject_cn="teste-renovacao"}`. |
 | C09 | **NetworkPolicy bloqueia pods externos.** Um pod do namespace `default` não deve alcançar o Pushgateway; se alcançasse, poderia enviar métricas falsas ou vazias. | Rede do cluster sem suporte a NetworkPolicy, ou policy alterada. |
 | C10 | **Pushgateway sem token de ServiceAccount.** O diretório do token não deve existir no container. | `automountServiceAccountToken` removido ou no lugar errado do manifesto. |
 | C11 | **Secrets ignorados por tipo.** Tokens de ServiceAccount, `dockercfg`, `dockerconfigjson` e releases do Helm não devem gerar séries. É o único filtro aplicado no servidor (`field_selectors`) e, por isso, não pode ser testado sem cluster. | Confira `secret_types_ignorados` e o `field_selectors` da task "Buscar os Secrets do cluster". |
+| C12 | **Dashboard no Grafana real.** Importação com o datasource do Thanos Querier: todos os painéis carregam, o filtro Namespace lista os namespaces e os números do resumo batem com as métricas de C05. Valida o que o D01/D02 não alcança: autenticação, labels extras do scrape e renderização. | Painel com erro de permissão: a ServiceAccount do datasource não tem `cluster-monitoring-view`. Tabela com colunas a mais ou vazias: confira as transformações *Merge*/*Filter fields by name* e os labels reais com Explore. |
 
 ---
 
-## 7. Evidência de que os testes detectam regressões
+## 8. Evidência de que os testes detectam regressões
 
-Ao criar a suíte, três defeitos reais foram reintroduzidos numa cópia do projeto, um de cada vez, para confirmar que os testes pegam cada um:
+Ao criar cada parte da suíte, defeitos reais foram introduzidos numa cópia do projeto, um de cada vez, para confirmar que os testes pegam cada um:
 
 | Defeito reintroduzido | Teste que falhou |
 |---|---|
 | Regex de PEM antiga (`[\s\S]+?`, vulnerável a DoS) | P22 |
 | Remoção do filtro `PYTHONWARNINGS` do número de série | P16 |
 | Remoção do escape de aspas no CN | Cenário principal inteiro (`setUpClass`), porque o payload ficou inválido |
+| Playbook ignorando o estado anterior do Pushgateway | P25, P26, P28 |
+| Sem a regra "a chave já existia" (todo certificado sem histórico vira renovado) | P24, P25, P27, P29 |
+| Marcações de renovação não reenviadas nas varreduras seguintes | P28 |
+| Token falso no formato do GitHub num arquivo novo (cópia temporária do projeto) | S01 (`leaks found: 1`, valor mascarado) |
+| Prioridade da coluna Situação invertida (expirado/≤ 30 antes de renovado) | D02 (o caso `renovado_curto` foi incluído justamente porque, sem ele, esse defeito passava) |
 
 Ao alterar um teste, repita esse exercício: introduza de propósito o defeito que o teste deveria pegar e confirme que ele falha.
 
 ---
 
-## 8. Como executar só uma parte e como adicionar testes
+## 9. Como executar só uma parte e como adicionar testes
 
 ### Execução parcial
 ```bash
@@ -349,7 +444,10 @@ python3 tests/test_playbook.py -v
 python3 tests/test_playbook.py -v Persistencia.test_P19_certificado_renovado_substitui_a_serie_antiga
 python3 tests/test_playbook.py -v -k P22
 
-# Só as regras de alerta (o run.sh faz a extração do spec): rode o run.sh completo
+# Só os testes de renovação
+python3 tests/test_playbook.py -v -k Renovacao
+
+# Regras de alerta e consultas do dashboard (o run.sh prepara os arquivos do promtool): rode o run.sh completo
 tests/run.sh
 ```
 
@@ -365,3 +463,8 @@ tests/run.sh
 2. Use `interval: 1m` e lembre que `time()` começa em 0.
 3. Informe `exp_labels` **e** `exp_annotations` completos; o promtool v3 compara os dois.
 4. Atualize o caderno e este documento.
+
+### Adicionando um teste do dashboard
+1. Se a consulta é de um painel novo, garanta um título único e um `refId` estável.
+2. Em `tests/dashboard_promql.py`, acrescente em `esperado` a chave `(título, refId)` e as amostras esperadas, usando os certificados sintéticos existentes ou criando novos em `certs`.
+3. Rode `tests/run.sh`, quebre a consulta de propósito para ver o D02 falhar e atualize o caderno e este documento.
