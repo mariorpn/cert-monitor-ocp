@@ -16,3 +16,6 @@ kubeconfig
 .env.*
 *.token
 vars.json
+
+# Manifestos gerados por tests/gerar_carga.py (contêm chave privada)
+carga-gerada/
