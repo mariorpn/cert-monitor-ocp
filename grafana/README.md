@@ -31,7 +31,7 @@ A cada varredura, o playbook compara as datas de expiração com as da varredura
 - a renovação aparece **na varredura seguinte** (até 12 horas depois, ou na hora com um Job manual);
 - um recurso novo não aparece como renovado, e trocar a ordem dos certificados de um bundle também não;
 - incluir um certificado novo num bundle existente aparece como renovação daquela chave;
-- se o pod do Pushgateway for recriado (armazenamento `emptyDir`), perdem-se as marcações de renovação, não os dados de expiração.
+- o estado fica persistido no PVC do Pushgateway e sobrevive à recriação do pod; só se perde se o volume for apagado (por exemplo, com `oc delete -k .`). Nesse caso, perdem-se as marcações de renovação, não os dados de expiração.
 
 O mesmo evento dispara o alerta informativo `CertificateRenewed` por 24 horas.
 

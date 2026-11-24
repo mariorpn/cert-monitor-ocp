@@ -23,6 +23,8 @@ Resultado esperado: `Todas as etapas executadas passaram.` e, no CI, nenhuma eta
 | L02 | `ansible-lint check-certs.yaml` | Perfil `production` sem falhas |
 | L03 | `kubectl kustomize .` | Manifestos gerados sem erro |
 | L04 | `kubeconform -strict` (com schemas de CRDs) | Todos os recursos válidos |
+| M01 | Persistência do Pushgateway (`tests/test_manifestos.py`) | O arquivo de `--persistence.file` fica num volume montado que vem de um PVC declarado no kustomize, no mesmo namespace e com tamanho definido |
+| M02 | Estratégia do Deployment com volume `ReadWriteOnce` | `strategy: Recreate` e 1 réplica |
 
 ### Playbook (`tests/test_playbook.py`)
 O playbook roda de verdade, sem cluster: os recursos são injetados e um servidor HTTP local faz o papel do Pushgateway.
@@ -96,6 +98,7 @@ Faça logo após o deploy. Use `NS=cert-monitor`.
 | C10 | Token do Pushgateway: `oc exec -n $NS deploy/pushgateway -- ls /var/run/secrets/kubernetes.io/serviceaccount` | `No such file or directory` |
 | C11 | Secrets ignorados por tipo: `oc logs job/$JOB -n $NS` não deve mencionar secrets `kubernetes.io/service-account-token`, `dockercfg`, `dockerconfigjson` ou `helm.sh/release.v1`; e `cert_not_after_timestamp_seconds{name=~"builder-dockercfg.*\|.*-token-.*"}` deve estar vazio | Nenhuma série desses tipos |
 | C12 | Dashboard: importe `grafana/cert-monitor-dashboard.json` seguindo `grafana/README.md` | Todos os painéis carregam sem erro; o filtro Namespace lista os namespaces monitorados; os números do resumo batem com C05 |
+| C13 | Persistência do Pushgateway: `oc get pvc pushgateway-data -n $NS` e, depois de uma varredura, `oc delete pod -n $NS -l app=pushgateway` | PVC `Bound`; o pod novo sobe sozinho e, em Observe → Metrics, `cert_monitor_certificates` e `cert_renewed_timestamp_seconds` continuam presentes logo após o restart, sem esperar a próxima varredura; `CertMonitorAbsent` não dispara |
 
 ### Roteiro C08: renovação ponta a ponta
 ```bash
@@ -127,6 +130,6 @@ JOB=teste-$(date +%s); oc create job --from=cronjob/cert-monitor-cron $JOB -n $N
 ```
 
 ## 3. Registro de execuções
-| Data | Commit / alteração | Automatizado | Cluster (C01–C12) | Responsável | Observações |
+| Data | Commit / alteração | Automatizado | Cluster (C01–C13) | Responsável | Observações |
 |---|---|---|---|---|---|
 | | | | | | |

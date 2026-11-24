@@ -113,6 +113,7 @@ fi
 etapa "L01 yamllint" yamllint .
 etapa "L02 ansible-lint" ansible-lint check-certs.yaml
 etapa "L03 kustomize build" sh -c 'kubectl kustomize . > /dev/null'
+etapa "M01-M02 manifestos (persistência do Pushgateway)" python3 tests/test_manifestos.py -v
 if command -v kubeconform > /dev/null; then
   etapa "L04 kubeconform" kubeconform_validar
 else

@@ -9,7 +9,7 @@ Este documento explica **cada teste** do [caderno de testes](CADERNO-DE-TESTES.m
 4. [Testes do playbook (P01–P30)](#4-testes-do-playbook-p01p30)
 5. [Testes das regras de alerta (A01–A08)](#5-testes-das-regras-de-alerta-a01a08)
 6. [Testes do dashboard (D01–D02)](#6-testes-do-dashboard-d01d02)
-7. [Testes no cluster (C01–C12)](#7-testes-no-cluster-c01c12)
+7. [Testes no cluster (C01–C13)](#7-testes-no-cluster-c01c13)
 8. [Evidência de que os testes detectam regressões](#8-evidência-de-que-os-testes-detectam-regressões)
 9. [Como executar só uma parte e como adicionar testes](#9-como-executar-só-uma-parte-e-como-adicionar-testes)
 
@@ -20,11 +20,11 @@ Este documento explica **cada teste** do [caderno de testes](CADERNO-DE-TESTES.m
 | Camada | IDs | Ferramenta | Onde roda | O que garante |
 |---|---|---|---|---|
 | Segredos | S01 | gitleaks | Local e CI | Nenhuma senha, token ou chave no histórico do git nem nos arquivos atuais |
-| Lint e manifestos | L01–L04 | yamllint, ansible-lint, kustomize, kubeconform | Local e CI | Os arquivos são válidos e os manifestos são aceitos pela API |
+| Lint e manifestos | L01–L04, M01–M02 | yamllint, ansible-lint, kustomize, kubeconform, `tests/test_manifestos.py` | Local e CI | Os arquivos são válidos, os manifestos são aceitos pela API e o Pushgateway persiste os dados |
 | Playbook | P01–P30 | `tests/test_playbook.py` (unittest + ansible-playbook) | Local e CI | A varredura extrai, filtra, analisa e envia as métricas corretamente |
 | Regras de alerta | A01–A08 | `tests/alertas.test.yaml` (promtool) | Local e CI | Os alertas disparam, não disparam e **resolvem** nas condições certas |
 | Dashboard | D01–D02 | `tests/dashboard_promql.py` (promtool) | Local e CI | As consultas do dashboard são válidas e calculam a situação, os contadores e o verde por 24h corretamente |
-| Cluster | C01–C12 | `oc` + console | Manual, após deploy | Integração real: RBAC, NetworkPolicy, coleta, Alertmanager |
+| Cluster | C01–C13 | `oc` + console | Manual, após deploy | Integração real: RBAC, NetworkPolicy, coleta, Alertmanager |
 
 O ponto de entrada automatizado é `tests/run.sh`. Ele executa as camadas em ordem, continua mesmo se uma etapa falhar (para mostrar todos os problemas de uma vez) e termina com um resumo: etapas puladas por falta de ferramenta e etapas que falharam. O código de saída é diferente de zero se qualquer etapa falhar, e é isso que reprova o CI.
 
@@ -110,6 +110,18 @@ Complementa o `.gitignore`, que já impede versionar por engano arquivos típico
 - **Como funciona:** `kubectl kustomize . | kubeconform -strict`, com os schemas padrão e o catálogo de CRDs (datreeio) para `ServiceMonitor` e `PrometheusRule`. `ImageStream` e `BuildConfig` são pulados, porque não há schema público para eles.
 - **Passa quando:** todos os recursos são válidos. Com `-strict`, campos desconhecidos também reprovam.
 - **Se falhar:** a mensagem indica o recurso e o caminho do campo. Localmente, a etapa é pulada se o `kubeconform` não estiver instalado; no CI ele é instalado com o sha256 conferido.
+
+### M01: Métricas do Pushgateway gravadas em volume persistente
+- **Por que existe:** o Pushgateway guarda as métricas e o estado da varredura anterior, que é usado na detecção de renovação. Com `emptyDir`, uma recriação do pod (deploy, troca de nó, drain) apagava tudo: as métricas sumiam por até 12 horas (o `CertMonitorAbsent` disparava) e as marcações de renovação se perdiam.
+- **Como funciona:** lê a saída do `kubectl kustomize .` (local, sem cluster) e segue a ligação: argumento `--persistence.file` do container, montagem de volume que contém esse caminho, volume do tipo `persistentVolumeClaim` e PVC declarado nos manifestos, no mesmo namespace, com `storage` solicitado.
+- **Passa quando:** a cadeia está completa.
+- **Se falhar:** a mensagem indica o elo quebrado: falta `--persistence.file`, o caminho fica fora de um volume, o volume é `emptyDir` ou o PVC não está no `kustomization.yaml`.
+
+### M02: Estratégia Recreate com volume ReadWriteOnce
+- **Por que existe:** com um volume `ReadWriteOnce`, a estratégia padrão (`RollingUpdate`) sobe o pod novo enquanto o antigo ainda monta o volume. Se o pod novo cair em outro nó, fica preso em *Multi-Attach error* e o rollout trava.
+- **Como funciona:** se o Pushgateway monta um PVC `ReadWriteOnce`, exige `strategy: Recreate` e 1 réplica.
+- **Passa quando:** as duas condições valem.
+- **Se falhar:** volte a estratégia para `Recreate`. Para mais de uma réplica seria preciso outro desenho, porque cada Pushgateway guarda o próprio estado.
 
 ---
 
@@ -289,7 +301,7 @@ Recursos do cenário principal:
 Testam a detecção de renovação, que alimenta `cert_renewed_timestamp_seconds`, o alerta `CertificateRenewed` e o verde por 24h do dashboard. Cada teste encadeia varreduras: a seguinte recebe como estado anterior (`GET /api/v1/metrics`) o que a anterior enviou, via `estado_api()`.
 
 #### P24: Primeira execução não marca nada
-- **Risco coberto:** no primeiro deploy, ou depois de o pod do Pushgateway ser recriado, não há estado anterior. Se a ausência de estado fosse tratada como "tudo mudou", todos os certificados do cluster apareceriam como renovados e o alerta informativo dispararia para cada um.
+- **Risco coberto:** no primeiro deploy, ou se o volume do Pushgateway for apagado, não há estado anterior. Se a ausência de estado fosse tratada como "tudo mudou", todos os certificados do cluster apareceriam como renovados e o alerta informativo dispararia para cada um.
 - **Como funciona:** uma varredura com o Pushgateway falso vazio.
 - **Passa quando:** o certificado é exportado normalmente e não há nenhuma série `cert_renewed_timestamp_seconds`.
 - **Se falhar:** confira a condição "a chave já existia" (`g in vistos`) na task "Detectar certificados renovados".
@@ -399,7 +411,7 @@ Todos usam `evaluation_interval: 1m` e séries com uma amostra por minuto, como 
 
 ---
 
-## 7. Testes no cluster (C01–C12)
+## 7. Testes no cluster (C01–C13)
 
 Validam o que os testes automatizados não alcançam: a integração com o OpenShift real. Faça-os após cada deploy relevante (mudança de imagem, de manifestos ou de alertas).
 
@@ -417,6 +429,7 @@ Validam o que os testes automatizados não alcançam: a integração com o OpenS
 | C10 | **Pushgateway sem token de ServiceAccount.** O diretório do token não deve existir no container. | `automountServiceAccountToken` removido ou no lugar errado do manifesto. |
 | C11 | **Secrets ignorados por tipo.** Tokens de ServiceAccount, `dockercfg`, `dockerconfigjson` e releases do Helm não devem gerar séries. É o único filtro aplicado no servidor (`field_selectors`) e, por isso, não pode ser testado sem cluster. | Confira `secret_types_ignorados` e o `field_selectors` da task "Buscar os Secrets do cluster". |
 | C12 | **Dashboard no Grafana real.** Importação com o datasource do Thanos Querier: todos os painéis carregam, o filtro Namespace lista os namespaces e os números do resumo batem com as métricas de C05. Valida o que o D01/D02 não alcança: autenticação, labels extras do scrape e renderização. | Painel com erro de permissão: a ServiceAccount do datasource não tem `cluster-monitoring-view`. Tabela com colunas a mais ou vazias: confira as transformações *Merge*/*Filter fields by name* e os labels reais com Explore. |
+| C13 | **Persistência real do Pushgateway.** PVC `Bound` e, depois de apagar o pod, as métricas e as marcações de renovação continuam disponíveis sem esperar a próxima varredura. Valida o que o M01/M02 não alcança: StorageClass, permissão de escrita no volume com o UID aleatório do OpenShift e recarga do arquivo. | PVC `Pending`: não há StorageClass padrão; defina `storageClassName`. Pod em `CrashLoopBackOff` com erro de escrita em `/data`: confira o `fsGroup` atribuído pela SCC. Pod novo preso em `ContainerCreating` com *Multi-Attach*: veja o M02. |
 
 ---
 
@@ -432,6 +445,8 @@ Ao criar cada parte da suíte, defeitos reais foram introduzidos numa cópia do 
 | Playbook ignorando o estado anterior do Pushgateway | P25, P26, P28 |
 | Sem a regra "a chave já existia" (todo certificado sem histórico vira renovado) | P24, P25, P27, P29 |
 | Métrica de únicos calculada sobre as entradas (`lista_certificados` no lugar de `pems_unicos`) | P30 |
+| Pushgateway voltando para `emptyDir` | M01 |
+| Estratégia do Deployment trocada para `RollingUpdate` com o PVC | M02 |
 | Marcações de renovação não reenviadas nas varreduras seguintes | P28 |
 | Token falso no formato do GitHub num arquivo novo (cópia temporária do projeto) | S01 (`leaks found: 1`, valor mascarado) |
 | Prioridade da coluna Situação invertida (expirado/≤ 30 antes de renovado) | D02 (o caso `renovado_curto` foi incluído justamente porque, sem ele, esse defeito passava) |

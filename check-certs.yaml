@@ -153,8 +153,8 @@
           {%- endfor -%}
           {{ result }}
 
-    # O estado da varredura anterior fica no próprio Pushgateway. Sem ele (primeira execução, Pushgateway
-    # recriado ou indisponível) nenhuma renovação é detectada; uma falha real aparece no envio (PUT).
+    # O estado da varredura anterior fica no próprio Pushgateway (persistido no PVC). Sem ele (primeira execução,
+    # volume apagado ou Pushgateway indisponível) nenhuma renovação é detectada; uma falha real aparece no envio (PUT).
     - name: Ler o estado anterior no Pushgateway
       ansible.builtin.uri:
         url: "{{ pushgateway_url }}/api/v1/metrics"

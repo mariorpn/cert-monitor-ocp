@@ -12,7 +12,7 @@ A solução integra-se à stack de monitoramento do OpenShift, gerando alertas n
 * `kustomization.yaml`: Ponto de entrada para implantação via Kustomize.
 * `manifestos-rbac-cronjob.yaml`: Namespace `cert-monitor`, ServiceAccount, ClusterRole (apenas get/list em secrets/configmaps), ClusterRoleBinding e o CronJob (às 00:00 e às 12:00, `0 */12 * * *`, no fuso do kube-controller-manager, normalmente UTC).
 * `configmap-exclude.yaml`: Regex dos namespaces e dos nomes de recursos ignorados na varredura.
-* `pushgateway.yaml`: Deployment, Service, ServiceMonitor e NetworkPolicy do Pushgateway.
+* `pushgateway.yaml`: PersistentVolumeClaim, Deployment, Service, ServiceMonitor e NetworkPolicy do Pushgateway.
 * `custom_alerts.yaml`: PrometheusRule com os alertas de expiração e de saúde do monitor.
 * `build-config.yaml`: ImageStream e BuildConfig para compilação nativa no cluster.
 * `tests/`: caderno de testes (`CADERNO-DE-TESTES.md`), explicação detalhada de cada teste (`DETALHAMENTO-DOS-TESTES.md`), script único `run.sh`, testes do playbook (`test_playbook.py`), das regras de alerta (`alertas.test.yaml`) e das consultas do dashboard (`dashboard_promql.py`).
@@ -50,7 +50,7 @@ A cada varredura, o playbook lê no Pushgateway o resultado da varredura anterio
 
 * A detecção acontece na varredura seguinte à renovação (até 12 horas, ou na hora com um Job manual).
 * Recurso novo não conta como renovação, e reordenar um bundle também não. Incluir um certificado novo num bundle existente conta como renovação daquela chave.
-* Se o estado anterior não estiver disponível (primeira execução, Pushgateway recriado ou indisponível na leitura), nenhuma renovação é marcada nessa varredura; as métricas de expiração não são afetadas.
+* Se o estado anterior não estiver disponível (primeira execução, volume do Pushgateway apagado ou Pushgateway indisponível na leitura), nenhuma renovação é marcada nessa varredura; as métricas de expiração não são afetadas.
 
 ## Dashboard Grafana
 O diretório [`grafana/`](grafana/README.md) traz um dashboard pronto para importar, com resumo, tabela de certificados com a situação de cada um, renovações dos últimos 7 dias, faixas de vencimento e saúde do monitor. Os certificados renovados ficam **verdes por 24 horas**. O guia explica como criar a credencial e o datasource apontando para o Thanos Querier do OpenShift.
@@ -59,6 +59,7 @@ O diretório [`grafana/`](grafana/README.md) traz um dashboard pronto para impor
 * OpenShift 4.x com o User Workload Monitoring habilitado (ver passo 1 abaixo; dispensável se usar a opção Platform, passo 4).
 * Registry interno de imagens habilitado: o CronJob usa a imagem `image-registry.openshift-image-registry.svc:5000/cert-monitor/ansible-cert-monitor:latest`.
 * Permissão de cluster-admin para criar o Namespace, a ClusterRole e a ClusterRoleBinding.
+* StorageClass padrão no cluster para o PVC do Pushgateway, ou `storageClassName` definido no PVC em `pushgateway.yaml`.
 
 ## Como Configurar e Instalar no Cluster
 
@@ -156,7 +157,9 @@ Esses certificados são listados no log do Job pela task "Listar certificados fo
 * A extração de PEM usa uma regex linear (só base64 entre `BEGIN` e `END`), para que um ConfigMap malicioso criado em qualquer namespace monitorado não trave a varredura.
 
 ## Considerações Operacionais
-* O Pushgateway persiste as métricas em `emptyDir` (sobrevive a reinícios do container). Se o pod for recriado, as métricas somem até a próxima execução (até 12 horas) e o `CertMonitorAbsent` dispara após 1 hora. Para evitar isso, troque o `emptyDir` por um PersistentVolumeClaim.
+* O Pushgateway grava as métricas a cada minuto no PersistentVolumeClaim `pushgateway-data` (1Gi, `ReadWriteOnce`) e as recarrega ao iniciar. Assim, as métricas e as marcações de renovação sobrevivem a reinícios e à recriação do pod (deploy, troca de nó, drain). Na pior hipótese, perde-se o último minuto antes de uma queda.
+  * O PVC não define `storageClassName` e usa a StorageClass padrão do cluster. Se não houver uma padrão, o PVC fica `Pending` e o pod não sobe: defina `storageClassName` no PVC.
+  * Como o volume é `ReadWriteOnce`, o Deployment usa `strategy: Recreate`: o pod antigo libera o volume antes de o novo subir, com alguns segundos sem coleta durante um rollout. O Pushgateway deve continuar com uma réplica.
 * O playbook carrega todos os Secrets e ConfigMaps do cluster na memória do pod (limite de `1Gi`, prazo de `activeDeadlineSeconds: 1800`). Em clusters grandes, acompanhe o consumo e ajuste `resources.limits.memory` no CronJob. Os certificados são analisados com o filtro `community.crypto.x509_certificate_info`, que roda no próprio processo do Ansible, sem um processo por certificado.
 
 ## Testes
@@ -166,10 +169,10 @@ Depois de qualquer alteração, siga o [caderno de testes](tests/CADERNO-DE-TEST
 tests/run.sh
 ```
 
-Ele executa a varredura de segredos (gitleaks), yamllint, ansible-lint, kustomize e kubeconform; os testes do playbook (`tests/test_playbook.py`, que roda o playbook de verdade com recursos simulados e um Pushgateway local); os testes das regras de alerta (`tests/alertas.test.yaml`, via `promtool`), inclusive o cenário de renovação de certificado; e os testes das consultas do dashboard (sintaxe e resultado, via `promtool`). O caderno traz também o roteiro de validação no cluster, e o [detalhamento dos testes](tests/DETALHAMENTO-DOS-TESTES.md) explica cada caso: o risco coberto, como funciona e o que investigar quando falha.
+Ele executa a varredura de segredos (gitleaks), yamllint, ansible-lint, kustomize, kubeconform e os testes de manifesto (`tests/test_manifestos.py`, persistência do Pushgateway); os testes do playbook (`tests/test_playbook.py`, que roda o playbook de verdade com recursos simulados e um Pushgateway local); os testes das regras de alerta (`tests/alertas.test.yaml`, via `promtool`), inclusive o cenário de renovação de certificado; e os testes das consultas do dashboard (sintaxe e resultado, via `promtool`). O caderno traz também o roteiro de validação no cluster, e o [detalhamento dos testes](tests/DETALHAMENTO-DOS-TESTES.md) explica cada caso: o risco coberto, como funciona e o que investigar quando falha.
 
 ## Como Remover
-Para desinstalar toda a solução, incluindo a imagem compilada, execute:
+Para desinstalar toda a solução, incluindo a imagem compilada e o PVC do Pushgateway (com as métricas guardadas), execute:
 
 ```bash
 oc delete -k .
