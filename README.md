@@ -24,11 +24,14 @@ A solução integra-se à stack de monitoramento do OpenShift, gerando alertas n
 |---|---|
 | `cert_not_after_timestamp_seconds` | Data de expiração (epoch UTC). Labels: `cert_namespace`, `tipo` (`SECRET`/`CONFIGMAP`), `name`, `key`, `indice` (posição no bundle), `subject_cn`, `not_after` (formato `AAAAMMDDhhmmssZ`, UTC). |
 | `cert_monitor_certificates` | Quantidade de entradas encontradas na última varredura. O mesmo certificado presente em vários recursos ou posições conta várias vezes. |
+| `cert_monitor_unique_certificates` | Quantidade de certificados distintos encontrados na última varredura (inclui os que não puderam ser analisados). |
 | `cert_monitor_parse_errors` | Certificados únicos (PEM) que não puderam ser analisados. |
 | `cert_renewed_timestamp_seconds` | Momento em que a renovação do certificado foi detectada (epoch UTC), mantido por 7 dias (`renovacao_retencao_dias`). Mesmos labels de `cert_not_after_timestamp_seconds`, referentes ao certificado novo. |
 | `cert_monitor_last_run_timestamp_seconds` | Momento da última varredura concluída (epoch UTC). |
 
-O Pushgateway acrescenta o label `job="cert_monitor"`, e o User Workload Monitoring acrescenta `namespace="cert-monitor"` (por isso o namespace do certificado fica em `cert_namespace`).
+**Entradas × únicos:** cada certificado distinto é analisado uma única vez e o resultado vale para todas as suas ocorrências. Por isso o loop da task "Analisar a validade de cada certificado" tem tantos itens quanto `cert_monitor_unique_certificates`, enquanto `cert_monitor_certificates` conta todas as ocorrências monitoradas. A cada execução, a task "Resumo da varredura" mostra no log os Secrets e ConfigMaps lidos, os recursos ignorados por namespace e por nome, as entradas, os certificados únicos, os erros de análise e as renovações detectadas, só com contagens e sem nenhum conteúdo de Secret.
+
+O Pushgateway acrescenta o label `job="cert_monitor"`, e o Prometheus que coleta as métricas (User Workload Monitoring ou plataforma) acrescenta `namespace="cert-monitor"` (por isso o namespace do certificado fica em `cert_namespace`).
 
 Os dias restantes são calculados no próprio Prometheus (`(cert_not_after_timestamp_seconds - time()) / 86400`), portanto continuam diminuindo mesmo que o CronJob pare de rodar.
 
@@ -53,7 +56,7 @@ A cada varredura, o playbook lê no Pushgateway o resultado da varredura anterio
 O diretório [`grafana/`](grafana/README.md) traz um dashboard pronto para importar, com resumo, tabela de certificados com a situação de cada um, renovações dos últimos 7 dias, faixas de vencimento e saúde do monitor. Os certificados renovados ficam **verdes por 24 horas**. O guia explica como criar a credencial e o datasource apontando para o Thanos Querier do OpenShift.
 
 ## Pré-requisitos
-* OpenShift 4.x com o User Workload Monitoring habilitado (ver passo 1 abaixo).
+* OpenShift 4.x com o User Workload Monitoring habilitado (ver passo 1 abaixo; dispensável se usar a opção Platform, passo 4).
 * Registry interno de imagens habilitado: o CronJob usa a imagem `image-registry.openshift-image-registry.svc:5000/cert-monitor/ansible-cert-monitor:latest`.
 * Permissão de cluster-admin para criar o Namespace, a ClusterRole e a ClusterRoleBinding.
 
@@ -84,6 +87,27 @@ oc start-build ansible-cert-monitor-build --from-dir=. --follow -n cert-monitor
 ```
 
 Até o primeiro build terminar, execuções do CronJob falharão por falta da imagem. Alterações no playbook (`check-certs.yaml`) ou nas dependências exigem um novo build; alterações nos manifestos e no ConfigMap de exclusão exigem apenas `oc apply -k .`.
+
+### 4. (Opcional) Alertas na categoria Platform
+Por padrão, as métricas e os alertas ficam no User Workload Monitoring e aparecem com a origem **User** em Observe → Alerting. Para que sejam coletados pelo Prometheus da plataforma e apareçam como **Platform**, execute:
+
+```bash
+oc label namespace cert-monitor openshift.io/cluster-monitoring="true"
+oc adm policy add-role-to-user view system:serviceaccount:openshift-monitoring:prometheus-k8s -n cert-monitor
+```
+
+* O label faz o Prometheus da plataforma (`openshift-monitoring`) passar a ler o ServiceMonitor e o PrometheusRule do namespace; o User Workload Monitoring deixa de monitorá-lo.
+* O `add-role-to-user view` dá ao Prometheus da plataforma (`prometheus-k8s`) permissão de leitura no namespace, necessária para descobrir o Pushgateway.
+* A NetworkPolicy do Pushgateway já libera a coleta a partir de `openshift-monitoring`; nenhum manifesto precisa mudar. O `oc apply -k .` não remove o label.
+
+> A Red Hat recomenda o User Workload Monitoring para namespaces de usuário. O label `openshift.io/cluster-monitoring` é destinado aos namespaces da plataforma, e usá-lo aqui foge do caminho suportado. As métricas passam a ocupar o Prometheus da plataforma, embora em volume pequeno.
+
+Para desfazer:
+
+```bash
+oc label namespace cert-monitor openshift.io/cluster-monitoring-
+oc adm policy remove-role-from-user view system:serviceaccount:openshift-monitoring:prometheus-k8s -n cert-monitor
+```
 
 ## Como Usar
 O sistema opera de forma autônoma a cada 12 horas.

@@ -203,6 +203,32 @@
           {{ result }}
       no_log: true
 
+    # Só contagens, nenhum conteúdo de Secret. Entradas = ocorrências monitoradas (certificado × recurso × posição);
+    # únicos = certificados distintos, cada um analisado uma única vez.
+    - name: Resumo da varredura
+      ansible.builtin.debug:
+        msg:
+          - "Secrets lidos: {{ secrets_brutos.resources | length }}"
+          - "ConfigMaps lidos: {{ configmaps_brutos.resources | length }}"
+          - "Recursos ignorados por namespace: {{ ignorados.por_namespace }}"
+          - "Recursos ignorados por nome: {{ ignorados.por_nome }}"
+          - "Entradas monitoradas: {{ lista_certificados | length }}"
+          - "Certificados únicos: {{ pems_unicos | length }}"
+          - "Erros de análise: {{ info_por_pem.values() | selectattr('not_after', 'undefined') | list | length }}"
+          - "Renovações detectadas nesta varredura: {{ detectadas }} (marcações anteriores mantidas: {{ renovacoes | length - detectadas | int }})"
+      vars:
+        detectadas: "{{ renovacoes | selectattr('ts', 'equalto', agora_epoch | int) | list | length }}"
+        ignorados: >-
+          {%- set c = namespace(ns=0, nome=0) -%}
+          {%- for obj in secrets_brutos.resources + configmaps_brutos.resources -%}
+            {%- if obj.metadata.namespace | regex_search(regex_ignorados) -%}
+              {%- set c.ns = c.ns + 1 -%}
+            {%- elif obj.metadata.name | regex_search(regex_nomes_ignorados) -%}
+              {%- set c.nome = c.nome + 1 -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ {'por_namespace': c.ns, 'por_nome': c.nome} }}
+
     # Datas ASN.1 são UTC; subtrair o epoch como datetime ingênuo evita depender do TZ do container.
     - name: Gerar payload de métricas do Prometheus
       ansible.builtin.set_fact:
@@ -226,6 +252,9 @@
           # HELP cert_monitor_certificates Certificados encontrados na última varredura
           # TYPE cert_monitor_certificates gauge
           cert_monitor_certificates {{ lista_certificados | length }}
+          # HELP cert_monitor_unique_certificates Certificados distintos encontrados na última varredura
+          # TYPE cert_monitor_unique_certificates gauge
+          cert_monitor_unique_certificates {{ pems_unicos | length }}
           # HELP cert_monitor_parse_errors Certificados únicos que não puderam ser analisados
           # TYPE cert_monitor_parse_errors gauge
           cert_monitor_parse_errors {{ info_por_pem.values() | selectattr('not_after', 'undefined') | list | length }}

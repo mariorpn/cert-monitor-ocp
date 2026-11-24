@@ -57,7 +57,7 @@
   "editable": true,
   "graphTooltip": 0,
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "5m",
   "timezone": "browser",
   "time": {
@@ -1275,7 +1275,7 @@
       "id": 14,
       "type": "timeseries",
       "title": "Certificados monitorados",
-      "description": "Entradas encontradas a cada varredura (cert_monitor_certificates). Quedas bruscas indicam certificados saindo da varredura (exclusões, recursos removidos ou erros).",
+      "description": "Entradas monitoradas (cert_monitor_certificates: cada certificado em cada recurso e posição) e certificados únicos (cert_monitor_unique_certificates: cada certificado distinto, analisado uma vez). Quedas bruscas indicam certificados saindo da varredura (exclusões, recursos removidos ou erros).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1297,7 +1297,19 @@
           "instant": false,
           "range": true,
           "format": "time_series",
-          "legendFormat": "Certificados monitorados"
+          "legendFormat": "Entradas"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(cert_monitor_unique_certificates)",
+          "refId": "B",
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "legendFormat": "Certificados únicos"
         }
       ],
       "fieldConfig": {
@@ -1317,17 +1329,43 @@
             "axisSoftMin": 0
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Certificados únicos"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#898781"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
-          "showLegend": false,
+          "showLegend": true,
           "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
-          "mode": "single",
-          "sort": "none"
+          "mode": "multi",
+          "sort": "desc"
         }
       }
     }

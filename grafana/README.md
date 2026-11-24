@@ -9,7 +9,7 @@
 | Resumo | Expirados · Vencem em ≤ 30 dias · Vencem em 31–60 dias · ✔ Renovados nas últimas 24h · Erros de análise · Última varredura |
 | Certificados | Tabela com todos os certificados, dos que vencem primeiro aos mais distantes: Situação, dias restantes, data de expiração, namespace, tipo, nome, chave, posição no bundle e CN. Cada coluna tem filtro. |
 | Renovações e vencimentos | Renovados nos últimos 7 dias (verde nas primeiras 24h) · Certificados por faixa de vencimento |
-| Saúde do monitor | Certificados monitorados ao longo do tempo |
+| Saúde do monitor | Certificados monitorados ao longo do tempo: entradas (cada certificado em cada recurso e posição) e certificados únicos (linha tracejada) |
 
 Filtros no topo: **Namespace** e **Tipo** (Secret/ConfigMap).
 

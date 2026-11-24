@@ -58,6 +58,7 @@ O playbook roda de verdade, sem cluster: os recursos são injetados e um servido
 | P27 | Bundle reordenado | Não é renovação |
 | P28 | Marcação nas varreduras seguintes | Mantida com o horário original por até 7 dias e descartada depois disso |
 | P29 | Estado anterior indisponível (HTTP 500) | Varredura e envio normais, sem marcar renovações |
+| P30 | Certificados únicos e resumo da varredura | `cert_monitor_unique_certificates` = certificados distintos; o log traz Secrets/ConfigMaps lidos, ignorados por namespace e por nome, entradas, únicos, erros e renovações com as contagens corretas |
 
 ### Regras de alerta (`tests/alertas.test.yaml`, via `promtool test rules`)
 | ID | Verifica | Esperado |

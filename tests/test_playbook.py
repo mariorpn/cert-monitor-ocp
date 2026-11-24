@@ -368,6 +368,19 @@ class CenarioPrincipal(unittest.TestCase):
         # Certificados fora da RFC continuam exportados
         self.assertEqual(len(certificados(self.series, name='rfc')), 3)
 
+    def test_P30_unicos_e_resumo_da_varredura(self):
+        # Certificados distintos fora das exclusões ('fora' só aparece em recursos ignorados) + o PEM inválido
+        unicos = {'normal', 'a', 'b', 'c', 'ext', 'incl', 'escape', 'crlf', 'cn_longo', 'serial0', 'serial_neg'}
+        self.assertEqual(escalar(self.series, 'cert_monitor_unique_certificates'), len(unicos) + 1)
+        entradas = int(escalar(self.series, 'cert_monitor_certificates'))
+        self.assertGreater(entradas, len(unicos) + 1)  # há certificados repetidos em vários recursos
+        for linha in (f'Secrets lidos: {len(self.secrets)}', f'ConfigMaps lidos: {len(self.configmaps)}',
+                      'Recursos ignorados por namespace: 4',  # openshift-etcd, openshift, kube-system, default
+                      'Recursos ignorados por nome: 4',  # kube-root-ca.crt, openshift-service-ca.crt e os 2 bundles
+                      f'Entradas monitoradas: {entradas}', f'Certificados únicos: {len(unicos) + 1}',
+                      'Erros de análise: 1', 'Renovações detectadas nesta varredura: 0 (marcações anteriores mantidas: 0)'):
+            self.assertIn(linha, self.r.saida)
+
     def test_P16_sem_avisos_crus_do_cryptography(self):
         self.assertNotIn('UserWarning', self.r.saida)
         self.assertNotIn('CryptographyDeprecationWarning', self.r.saida)
@@ -430,7 +443,7 @@ class Renovacao(unittest.TestCase):
         r1, _ = self.varredura([secret('app', 'web', {'tls.crt': Cert('web', dias=10).pem}),
                                 secret('app', 'estavel', {'tls.crt': estavel.pem})])
         novo = Cert('web', dias=400)
-        _, series = self.varredura([secret('app', 'web', {'tls.crt': novo.pem}),
+        r2, series = self.varredura([secret('app', 'web', {'tls.crt': novo.pem}),
                                     secret('app', 'estavel', {'tls.crt': estavel.pem}),
                                     secret('app', 'recurso-novo', {'tls.crt': Cert('novo').pem})], anterior=r1)
         marcados = renovados(series)
@@ -440,6 +453,7 @@ class Renovacao(unittest.TestCase):
         cert = certificados(series, name='web')[0]
         self.assertEqual({k: v for k, v in marcados[0].items() if k != '_valor'},
                          {k: v for k, v in cert.items() if k != '_valor'})
+        self.assertIn('Renovações detectadas nesta varredura: 1 (marcações anteriores mantidas: 0)', r2.saida)
 
     def test_P26_renovacao_para_validade_menor(self):
         r1, _ = self.varredura([secret('app', 'web', {'tls.crt': Cert('web', dias=300).pem})])
@@ -466,6 +480,8 @@ class Renovacao(unittest.TestCase):
                 r3 = executar(recursos, estado=estado)
                 marcados = renovados(interpretar(r3.payload), name='web')
                 self.assertEqual([int(m['_valor']) for m in marcados], [ts] if mantida else [])
+                self.assertIn('Renovações detectadas nesta varredura: 0 (marcações anteriores mantidas: '
+                              f'{1 if mantida else 0})', r3.saida)
 
     def test_P29_estado_indisponivel_nao_impede_o_envio(self):
         r = executar([secret('app', 'web', {'tls.crt': Cert('web').pem})], estado=500)

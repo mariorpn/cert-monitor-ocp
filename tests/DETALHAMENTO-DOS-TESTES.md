@@ -6,7 +6,7 @@ Este documento explica **cada teste** do [caderno de testes](CADERNO-DE-TESTES.m
 1. [Visão geral da suíte](#1-visão-geral-da-suíte)
 2. [Como a suíte funciona por dentro](#2-como-a-suíte-funciona-por-dentro)
 3. [Segredos, lint e manifestos (S01, L01–L04)](#3-segredos-lint-e-manifestos-s01-l01l04)
-4. [Testes do playbook (P01–P29)](#4-testes-do-playbook-p01p29)
+4. [Testes do playbook (P01–P30)](#4-testes-do-playbook-p01p30)
 5. [Testes das regras de alerta (A01–A08)](#5-testes-das-regras-de-alerta-a01a08)
 6. [Testes do dashboard (D01–D02)](#6-testes-do-dashboard-d01d02)
 7. [Testes no cluster (C01–C12)](#7-testes-no-cluster-c01c12)
@@ -21,7 +21,7 @@ Este documento explica **cada teste** do [caderno de testes](CADERNO-DE-TESTES.m
 |---|---|---|---|---|
 | Segredos | S01 | gitleaks | Local e CI | Nenhuma senha, token ou chave no histórico do git nem nos arquivos atuais |
 | Lint e manifestos | L01–L04 | yamllint, ansible-lint, kustomize, kubeconform | Local e CI | Os arquivos são válidos e os manifestos são aceitos pela API |
-| Playbook | P01–P29 | `tests/test_playbook.py` (unittest + ansible-playbook) | Local e CI | A varredura extrai, filtra, analisa e envia as métricas corretamente |
+| Playbook | P01–P30 | `tests/test_playbook.py` (unittest + ansible-playbook) | Local e CI | A varredura extrai, filtra, analisa e envia as métricas corretamente |
 | Regras de alerta | A01–A08 | `tests/alertas.test.yaml` (promtool) | Local e CI | Os alertas disparam, não disparam e **resolvem** nas condições certas |
 | Dashboard | D01–D02 | `tests/dashboard_promql.py` (promtool) | Local e CI | As consultas do dashboard são válidas e calculam a situação, os contadores e o verde por 24h corretamente |
 | Cluster | C01–C12 | `oc` + console | Manual, após deploy | Integração real: RBAC, NetworkPolicy, coleta, Alertmanager |
@@ -113,10 +113,10 @@ Complementa o `.gitignore`, que já impede versionar por engano arquivos típico
 
 ---
 
-## 4. Testes do playbook (P01–P29)
+## 4. Testes do playbook (P01–P30)
 
-### Cenário principal (P01–P16)
-Os testes P01 a P16 compartilham **uma única execução** do playbook (`CenarioPrincipal.setUpClass`), com um conjunto de recursos que exercita todos os caminhos ao mesmo tempo. Isso deixa a suíte rápida (cerca de 10 s no total). Se essa execução falhar, todos os testes do cenário aparecem como `ERROR: setUpClass`, com o fim do log do Ansible na mensagem.
+### Cenário principal (P01–P16, P30)
+Os testes P01 a P16 e o P30 compartilham **uma única execução** do playbook (`CenarioPrincipal.setUpClass`), com um conjunto de recursos que exercita todos os caminhos ao mesmo tempo. Isso deixa a suíte rápida (cerca de 10 s no total). Se essa execução falhar, todos os testes do cenário aparecem como `ERROR: setUpClass`, com o fim do log do Ansible na mensagem.
 
 Recursos do cenário principal:
 
@@ -230,6 +230,12 @@ Recursos do cenário principal:
 - **Como funciona:** com o `PYTHONWARNINGS` do CronJob, procura `UserWarning`, `CryptographyDeprecationWarning` e `errantly sent data directly to stderr` na saída.
 - **Passa quando:** nenhum dos três aparece.
 - **Se falhar:** algum filtro do `PYTHONWARNINGS` foi removido ou alterado, ou uma nova versão do `cryptography` mudou o texto do aviso. Rode o playbook e copie o início exato da nova mensagem para o filtro. Se for um aviso de outra natureza, considere tratá-lo também no relatório RFC (P15).
+
+#### P30: Certificados únicos e resumo da varredura
+- **Risco coberto:** o loop de análise roda sobre certificados **distintos**, enquanto `cert_monitor_certificates` conta **ocorrências**. Sem os dois números visíveis, uma mudança de exclusões ou de deduplicação parece perda de cobertura. Foi o que aconteceu ao comparar a versão original (~20.000 itens no loop) com a atual (~400 únicos e ~6.000 entradas).
+- **Como funciona:** no cenário principal, compara `cert_monitor_unique_certificates` com os certificados distintos que sobram depois das exclusões (11 certificados mais o PEM inválido) e confere que as entradas são mais numerosas, porque há certificados repetidos. Confere também cada linha da task "Resumo da varredura": Secrets e ConfigMaps lidos, 4 recursos ignorados por namespace, 4 por nome, entradas, únicos, 1 erro de análise e nenhuma renovação. Os testes P25 e P28 conferem a linha de renovações (1 detectada; 1 marcação mantida).
+- **Passa quando:** a métrica e todas as linhas do resumo têm os valores esperados.
+- **Se falhar:** se a métrica de únicos veio igual à de entradas, ela está usando `lista_certificados` no lugar de `pems_unicos`. Se uma contagem de ignorados divergir, compare a lógica da task "Resumo da varredura" com o filtro da task "Extrair e organizar certificados", que devem ser equivalentes (primeiro namespace, depois nome).
 
 ### Exclusão (P17–P18)
 
@@ -376,7 +382,7 @@ Todos usam `evaluation_interval: 1m` e séries com uma amostra por minuto, como 
 
 #### D01: Sintaxe das consultas
 - **Risco coberto:** uma consulta com erro de sintaxe só seria percebida ao abrir o dashboard, com o painel mostrando erro.
-- **Como funciona:** todas as consultas do JSON (18 hoje) são validadas pelo `promtool check rules` (seção 2.5).
+- **Como funciona:** todas as consultas do JSON (19 hoje) são validadas pelo `promtool check rules` (seção 2.5).
 - **Passa quando:** `SUCCESS: N rules found`.
 - **Se falhar:** a mensagem do promtool indica a regra `dashboard:consulta_N`. A ordem segue a ordem dos painéis no JSON.
 
@@ -425,6 +431,7 @@ Ao criar cada parte da suíte, defeitos reais foram introduzidos numa cópia do 
 | Remoção do escape de aspas no CN | Cenário principal inteiro (`setUpClass`), porque o payload ficou inválido |
 | Playbook ignorando o estado anterior do Pushgateway | P25, P26, P28 |
 | Sem a regra "a chave já existia" (todo certificado sem histórico vira renovado) | P24, P25, P27, P29 |
+| Métrica de únicos calculada sobre as entradas (`lista_certificados` no lugar de `pems_unicos`) | P30 |
 | Marcações de renovação não reenviadas nas varreduras seguintes | P28 |
 | Token falso no formato do GitHub num arquivo novo (cópia temporária do projeto) | S01 (`leaks found: 1`, valor mascarado) |
 | Prioridade da coluna Situação invertida (expirado/≤ 30 antes de renovado) | D02 (o caso `renovado_curto` foi incluído justamente porque, sem ele, esse defeito passava) |

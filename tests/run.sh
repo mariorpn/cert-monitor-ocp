@@ -118,7 +118,7 @@ if command -v kubeconform > /dev/null; then
 else
   pular "L04 kubeconform" "kubeconform não instalado"
 fi
-etapa "P01-P29 testes do playbook" python3 tests/test_playbook.py -v
+etapa "P01-P30 testes do playbook" python3 tests/test_playbook.py -v
 if [[ ${#promtool_cmd[@]} -gt 0 ]]; then
   etapa "A01-A08 regras de alerta" alertas_validar
   etapa "D01-D02 consultas do dashboard" dashboard_validar
